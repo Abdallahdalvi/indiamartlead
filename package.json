@@ -1,0 +1,32 @@
+{
+  "name": "leadsync-indiamart",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Chrome Extension to sync IndiaMART leads to Google Sheets with SHA-256 deduplication",
+  "scripts": {
+    "dev": "concurrently -n main,content -c cyan,magenta \"vite build --watch\" \"vite build --config vite.content.config.ts --watch\"",
+    "build": "vite build && vite build --config vite.content.config.ts",
+    "build:main": "vite build",
+    "build:content": "vite build --config vite.content.config.ts",
+    "type-check": "tsc --noEmit",
+    "preview": "echo 'Load the dist/ folder as an unpacked extension via chrome://extensions (Developer Mode)'"
+  },
+  "dependencies": {
+    "lucide-react": "^0.400.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.268",
+    "@types/react": "^18.3.1",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.19",
+    "concurrently": "^8.2.2",
+    "postcss": "^8.4.38",
+    "tailwindcss": "^3.4.4",
+    "typescript": "^5.4.5",
+    "vite": "^5.3.1"
+  }
+}
