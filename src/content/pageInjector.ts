@@ -1,12 +1,9 @@
 /**
  * pageInjector.ts
  *
- * Injects a small script into the PAGE's main world (not the isolated content
- * script world) so it can intercept fetch() and XMLHttpRequest before
- * IndiaMART's own code sends them.
- *
- * Captured lead payloads are relayed to the content script via
- * window.postMessage({ type: 'LEADSYNC_API_LEADS', leads: [...] }).
+ * Injects into the PAGE's MAIN world to intercept fetch() + XHR.
+ * Captures ANY JSON response that contains an array of lead-like objects.
+ * No URL filtering — IndiaMART's API URL may vary; we detect by content.
  */
 
 const INJECTOR_CODE = /* javascript */ `
@@ -14,127 +11,126 @@ const INJECTOR_CODE = /* javascript */ `
   if (window.__leadsyncInjected) return;
   window.__leadsyncInjected = true;
 
-  // ── Field name maps for IndiaMART's JSON ──────────────────────────────────
-  // IndiaMART uses abbreviated field names in their API responses.
-  // We try both their internal names AND generic equivalents.
+  var KNOWN_NAME_FIELDS   = ['glusr_cntct_nm','contact_name','name','sender_name','cntct_nm','buyer_name','cname','ContactName'];
+  var KNOWN_MOBILE_FIELDS = ['cntct_mob','mobile','phone','contact_mobile','mob','Mobile','ContactMobile','mobileNo'];
+  var KNOWN_PROD_FIELDS   = ['prod_desc','product','requirement','req','prd_desc','Product','Requirement','prodDesc'];
+  var KNOWN_MSG_FIELDS    = ['msg','message','last_msg','lastMessage','inq_msg','query','Msg','Message'];
+  var KNOWN_CITY_FIELDS   = ['glusr_city_nm','city','location','city_nm','City','Location'];
+  var KNOWN_SRC_FIELDS    = ['src_type','source','lead_source','srctype','lsrc','Source','LeadSource'];
+  var KNOWN_DATE_FIELDS   = ['msgdt','date','created_at','dt','msg_dt','lead_date','Date','LeadDate','adddt'];
+  var KNOWN_LABEL_FIELDS  = ['label_nm','labels','label','tag','Labels','Label'];
 
-  function str(v) {
-    if (v === null || v === undefined) return null;
-    const s = String(v).trim();
-    return s || null;
-  }
-
-  function parseSingleLead(obj) {
-    if (!obj || typeof obj !== 'object') return null;
-    const k = Object.keys(obj);
-    // Must have something that looks like a name or phone
-    const hasData = k.some(function(key) {
-      return key.match(/name|nm|mob|phone|contact|cntct/i);
-    });
-    if (!hasData) return null;
-
-    return {
-      buyerName:   str(obj.glusr_cntct_nm) || str(obj.contact_name) || str(obj.name) ||
-                   str(obj.sender_name)     || str(obj.cntct_nm)     || str(obj.buyer_name),
-      mobile:      str(obj.cntct_mob)  || str(obj.mobile)  || str(obj.phone) ||
-                   str(obj.contact_mobile) || str(obj.mob),
-      product:     str(obj.prod_desc)  || str(obj.product) || str(obj.requirement) ||
-                   str(obj.req)        || str(obj.prd_desc),
-      requirement: str(obj.msg)        || str(obj.message) || str(obj.last_msg)    ||
-                   str(obj.lastMessage)|| str(obj.inq_msg) || str(obj.query),
-      city:        str(obj.glusr_city_nm) || str(obj.city) || str(obj.location)    ||
-                   str(obj.city_nm),
-      source:      str(obj.src_type)   || str(obj.source)  || str(obj.lead_source) ||
-                   str(obj.srctype)    || str(obj.lsrc),
-      leadDate:    str(obj.msgdt)      || str(obj.date)    || str(obj.created_at)  ||
-                   str(obj.dt)         || str(obj.msg_dt)  || str(obj.lead_date),
-      labels:      str(obj.label_nm)   || str(obj.labels)  || str(obj.label)       ||
-                   str(obj.tag),
-      quantity:    str(obj.qty)        || str(obj.quantity),
-      company:     str(obj.glusr_cmpny_nm) || str(obj.company),
-      email:       str(obj.email)      || str(obj.cntct_email),
-      state:       str(obj.state)      || str(obj.glusr_state_nm),
-      budget:      null,
-      sourceUrl:   window.location.href,
-    };
-  }
-
-  function tryExtractLeads(data) {
-    if (!data || typeof data !== 'object') return null;
-
-    // Candidates to check for lead arrays
-    const sources = [
-      data,
-      data.data,
-      data.DATA,
-      data.result,
-      data.results,
-      data.response,
-      data.contacts,
-      data.leads,
-      data.rows,
-      data.list,
-      data.items,
-      data.records,
-      data.Contact,
-      data.Contacts,
-    ];
-
-    for (let i = 0; i < sources.length; i++) {
-      const src = sources[i];
-      if (!src) continue;
-
-      if (Array.isArray(src) && src.length > 0) {
-        const leads = src.map(parseSingleLead).filter(Boolean);
-        if (leads.length > 0) return leads;
-      }
-
-      // Sometimes it's { '0': {...}, '1': {...} }
-      if (typeof src === 'object' && !Array.isArray(src)) {
-        const vals = Object.values(src);
-        if (vals.length > 0 && typeof vals[0] === 'object' && vals[0] !== null) {
-          const leads = vals.map(parseSingleLead).filter(Boolean);
-          if (leads.length > 5) return leads; // at least 5 to avoid false positives
+  function first(obj, fields) {
+    for (var i = 0; i < fields.length; i++) {
+      var v = obj[fields[i]];
+      if (v !== null && v !== undefined && String(v).trim()) return String(v).trim();
+    }
+    // fallback: scan all keys case-insensitively
+    var keys = Object.keys(obj);
+    for (var j = 0; j < fields.length; j++) {
+      var f = fields[j].toLowerCase();
+      for (var k = 0; k < keys.length; k++) {
+        if (keys[k].toLowerCase() === f && obj[keys[k]] !== null && obj[keys[k]] !== undefined) {
+          return String(obj[keys[k]]).trim() || null;
         }
       }
     }
     return null;
   }
 
-  function handleData(url, data) {
-    // Only care about indiamart URLs
-    if (!url) return;
-    const u = String(url).toLowerCase();
-    const relevant = u.includes('messagecentre') || u.includes('msgcntr') ||
-                     u.includes('contact')       || u.includes('getall')  ||
-                     u.includes('lead')          || u.includes('seller');
-    if (!relevant) return;
-
-    const leads = tryExtractLeads(data);
-    if (leads && leads.length > 0) {
-      console.log('[LeadSync] Captured', leads.length, 'leads from API:', url);
-      window.postMessage({ type: 'LEADSYNC_API_LEADS', leads: leads, url: url }, '*');
-    }
+  function looksLikeLead(obj) {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+    var keys = Object.keys(obj);
+    var hasName   = keys.some(function(k){ return /name|nm|cntct|sender/i.test(k); });
+    var hasMobile = keys.some(function(k){ return /mob|phone|contact|cntct/i.test(k); });
+    return hasName || hasMobile;
   }
 
-  // ── Intercept fetch ────────────────────────────────────────────────────────
+  function parseLead(obj) {
+    return {
+      buyerName:   first(obj, KNOWN_NAME_FIELDS),
+      mobile:      first(obj, KNOWN_MOBILE_FIELDS),
+      product:     first(obj, KNOWN_PROD_FIELDS),
+      requirement: first(obj, KNOWN_MSG_FIELDS),
+      city:        first(obj, KNOWN_CITY_FIELDS),
+      source:      first(obj, KNOWN_SRC_FIELDS),
+      leadDate:    first(obj, KNOWN_DATE_FIELDS),
+      labels:      first(obj, KNOWN_LABEL_FIELDS),
+      quantity:    first(obj, ['qty','quantity']),
+      company:     first(obj, ['glusr_cmpny_nm','company','Company']),
+      email:       first(obj, ['email','cntct_email','Email']),
+      state:       first(obj, ['state','glusr_state_nm','State']),
+      budget:      null,
+      sourceUrl:   window.location.href,
+    };
+  }
+
+  function tryExtract(data) {
+    if (!data) return null;
+
+    var candidates = [
+      data, data.data, data.DATA, data.result, data.results,
+      data.response, data.RESPONSE, data.contacts, data.Contacts,
+      data.leads, data.Leads, data.rows, data.list, data.items,
+      data.records, data.Contact, data.payload, data.body,
+    ].filter(function(x){ return x != null; });
+
+    for (var i = 0; i < candidates.length; i++) {
+      var c = candidates[i];
+
+      // Direct array of lead objects
+      if (Array.isArray(c) && c.length > 0 && looksLikeLead(c[0])) {
+        var parsed = c.map(parseLead).filter(function(l){ return l.buyerName || l.mobile; });
+        if (parsed.length > 0) return parsed;
+      }
+
+      // Nested: { "0":{...}, "1":{...} } style
+      if (c && typeof c === 'object' && !Array.isArray(c)) {
+        var vals = Object.values(c);
+        if (vals.length >= 5 && looksLikeLead(vals[0])) {
+          var parsed2 = vals.map(parseLead).filter(function(l){ return l.buyerName || l.mobile; });
+          if (parsed2.length > 0) return parsed2;
+        }
+      }
+    }
+    return null;
+  }
+
+  function handleResponse(url, data) {
+    var leads = tryExtract(data);
+    if (!leads || leads.length === 0) return;
+
+    console.log('[LeadSync] Captured', leads.length, 'leads from:', url);
+    window.postMessage({ type: 'LEADSYNC_API_LEADS', leads: leads, url: url }, '*');
+  }
+
+  function safeParse(text) {
+    if (!text) return null;
+    var t = text.trimStart();
+    if (t[0] !== '{' && t[0] !== '[') return null;
+    try { return JSON.parse(text); } catch(e) { return null; }
+  }
+
+  // ── Intercept fetch ──────────────────────────────────────────────────────
   var origFetch = window.fetch;
   window.fetch = function() {
-    var url = (typeof arguments[0] === 'string') ? arguments[0]
-            : (arguments[0] && arguments[0].url) ? arguments[0].url : '';
+    var url = '';
+    if (typeof arguments[0] === 'string') url = arguments[0];
+    else if (arguments[0] && arguments[0].url) url = arguments[0].url;
+
     return origFetch.apply(this, arguments).then(function(resp) {
-      resp.clone().text().then(function(text) {
-        try {
-          if (text && (text.trimStart()[0] === '{' || text.trimStart()[0] === '[')) {
-            handleData(url, JSON.parse(text));
-          }
-        } catch(e) {}
-      }).catch(function() {});
+      var contentType = resp.headers ? resp.headers.get('content-type') || '' : '';
+      if (contentType.indexOf('json') !== -1 || url.indexOf('.json') !== -1) {
+        resp.clone().text().then(function(text) {
+          var data = safeParse(text);
+          if (data) handleResponse(url, data);
+        }).catch(function(){});
+      }
       return resp;
     });
   };
 
-  // ── Intercept XHR ─────────────────────────────────────────────────────────
+  // ── Intercept XHR ────────────────────────────────────────────────────────
   var origOpen = XMLHttpRequest.prototype.open;
   var origSend = XMLHttpRequest.prototype.send;
 
@@ -146,65 +142,51 @@ const INJECTOR_CODE = /* javascript */ `
   XMLHttpRequest.prototype.send = function() {
     var xhr = this;
     xhr.addEventListener('load', function() {
-      if (xhr.status >= 200 && xhr.status < 300 && xhr._lsUrl) {
-        try {
-          var text = xhr.responseText;
-          if (text && (text.trimStart()[0] === '{' || text.trimStart()[0] === '[')) {
-            handleData(xhr._lsUrl, JSON.parse(text));
-          }
-        } catch(e) {}
+      if (xhr.status < 200 || xhr.status >= 300) return;
+      var ct = xhr.getResponseHeader ? xhr.getResponseHeader('Content-Type') || '' : '';
+      var isJson = ct.indexOf('json') !== -1 || (xhr._lsUrl && xhr._lsUrl.indexOf('.json') !== -1);
+      if (!isJson) {
+        var text = xhr.responseText || '';
+        var t = text.trimStart();
+        if (t[0] !== '{' && t[0] !== '[') return;
       }
+      var data = safeParse(xhr.responseText);
+      if (data) handleResponse(xhr._lsUrl || '', data);
     });
     return origSend.apply(this, arguments);
   };
 
-  console.log('[LeadSync] Interceptor ready on', window.location.href);
+  console.log('[LeadSync] API interceptor ready');
 })();
 `;
 
 export function injectInterceptor(): void {
-  // Only inject once
   if (document.querySelector('[data-leadsync-injected]')) return;
-
   const script = document.createElement('script');
   script.setAttribute('data-leadsync-injected', 'true');
   script.textContent = INJECTOR_CODE;
   (document.head ?? document.documentElement).appendChild(script);
-  script.remove(); // Remove the element but the code has already run
+  script.remove();
 }
 
 /**
- * Trigger IndiaMART to re-fetch its lead list by simulating a tab click.
- * This forces the page to make a fresh API call which our interceptor captures.
+ * Trigger IndiaMART to re-issue its lead list API call.
+ * Clicks the "All" contacts tab which forces a data refresh.
  */
 export function triggerLeadRefresh(): void {
-  // Try clicking the "All" contacts tab
-  const allTabSelectors = [
-    'a[data-filter="all"]',
-    '.tab-all', '.all-tab', '[data-tab="all"]',
-    '.filter-tab:first-child', '.contacts-tab:first-child',
-    'li.active a', '.tab.active',
-    // Text-based
-    'a, button, li',
-  ];
+  // Click "All" tab to reload current page's leads
+  const allTab = Array.from(document.querySelectorAll<HTMLElement>('a, button, li span, div'))
+    .find((el) => {
+      const txt = (el.textContent ?? '').trim();
+      return /^all$/i.test(txt) || /^all contacts$/i.test(txt);
+    });
 
-  for (const sel of allTabSelectors) {
-    if (!sel.includes(', ')) {
-      const el = document.querySelector<HTMLElement>(sel);
-      if (el) { el.click(); return; }
-      continue;
-    }
-    // Text-based: find "All" tab
-    const candidates = Array.from(document.querySelectorAll<HTMLElement>(sel));
-    for (const c of candidates) {
-      const txt = (c.textContent ?? '').trim();
-      if (/^all$/i.test(txt) || /^all contacts$/i.test(txt)) {
-        c.click();
-        return;
-      }
-    }
+  if (allTab) {
+    allTab.click();
+    return;
   }
 
-  // Last resort: reload the page (will re-trigger API calls)
-  console.log('[LeadSync] Could not find refresh trigger, data will be captured on next navigation.');
+  // Fallback: click any active filter tab to re-trigger the current query
+  const activeTab = document.querySelector<HTMLElement>('.active a, a.active, .selected a, li.active');
+  if (activeTab) activeTab.click();
 }

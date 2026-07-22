@@ -1,262 +1,272 @@
 /**
  * leadmanager.ts
  *
- * Two-strategy lead extraction for seller.indiamart.com/messagecentre:
+ * Lead extraction for seller.indiamart.com/messagecentre.
  *
- * Strategy A — API interception (PRIMARY, most reliable)
- *   The page injector (pageInjector.ts) captures IndiaMART's API responses
- *   and posts them via window.postMessage. This module stores them in memory
- *   so the bulk sync can drain them page by page.
- *
- * Strategy B — DOM phone-number walk (FALLBACK)
- *   Finds Indian phone numbers anywhere on the page, walks up the DOM to
- *   the containing row, then extracts sibling data. Works regardless of
- *   class names or markup changes.
+ * DOM Fallback (Strategy B) — fixes the garbage import issue:
+ *   • Finds the table with the most phone-containing rows
+ *   • For each TR, locates the SENDER cell (the one containing a phone number
+ *     in one of the first 3 TDs — not Notes/Messages/Actions columns)
+ *   • Uses fixed column offsets from the sender column index
+ *   • Skips rows whose "phone" cell also contains known UI noise:
+ *     "Add note", "Tomorrow", "USER_", "Catalog Link", "Follow Up", etc.
  */
 
 import type { Lead } from '@/types';
 
-// ─── Shared lead store ────────────────────────────────────────────────────────
-// Populated by the postMessage listener in index.ts.
+// ─── Shared store (populated by API capture via postMessage) ──────────────────
 
 let _capturedLeads: Lead[] = [];
-let _onLeadsCaptured: ((leads: Lead[]) => void) | null = null;
 
 export function setCapturedLeads(leads: Lead[]): void {
   _capturedLeads = leads;
-  _onLeadsCaptured?.(leads);
 }
-
 export function getCapturedLeads(): Lead[] {
   return _capturedLeads;
 }
-
 export function clearCapturedLeads(): void {
   _capturedLeads = [];
 }
 
-export function onLeadsCaptured(cb: (leads: Lead[]) => void): void {
-  _onLeadsCaptured = cb;
-}
-
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function clean(text: string | null | undefined, max = 500): string | null {
+const PHONE_RE   = /(?:0|\+91|91)?([6-9]\d{9})/;
+const NOISE_RE   = /add note|tomorrow|follow.?up|deal done|contacted|fresh|catalog|catalogue|user_|buylead|direct|other|label|reminder|manage col/i;
+const DATE_RE    = /\d{1,2}\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)|\d{2}[\/\-]\d{2}[\/\-]\d{2,4}|\d{2}:\d{2}/i;
+const SOURCE_RE  = /^(buylead|direct|other|catalog link|catalogue link|buyleads)$/i;
+
+function clean(text: string | null | undefined, max = 400): string | null {
   if (!text) return null;
   const t = text.trim().replace(/\s+/g, ' ');
   return t.length > max ? t.substring(0, max) : t || null;
 }
 
-const PHONE_RE = /(?:0|\+91|91)?[6-9]\d{9}/g;
-
-function extractPhone(text: string): string | null {
+function extractPhoneFrom(text: string): string | null {
   PHONE_RE.lastIndex = 0;
   const m = PHONE_RE.exec(text);
-  return m ? m[0].replace(/[^\d]/g, '') : null;
+  return m ? m[1] : null;
 }
 
-// ─── Strategy B: DOM phone-number walk ───────────────────────────────────────
+function isNoiseText(text: string): boolean {
+  return NOISE_RE.test(text) || text.trim().length === 0;
+}
+
+// ─── Find the leads table ─────────────────────────────────────────────────────
 
 /**
- * Walk up the DOM from a text node to find the nearest table row (TR)
- * or a block-level container that likely represents one lead.
+ * Find the table element that contains the most rows with phone numbers.
+ * This is the leads table — distinct from header/sidebar/footer tables.
  */
-function findRow(node: Node): Element | null {
-  let el: Element | null = node.nodeType === Node.ELEMENT_NODE
-    ? (node as Element)
-    : node.parentElement;
+function findLeadsTable(): Element | null {
+  // Try known selectors first
+  const known = [
+    '#lbody', '#contactListTable', '#leadTable', '#allContactsTable',
+    '.contact-list table', '.lead-list table', '.msgcntr-table',
+    '[class*="contactList"] table', '[class*="leadList"] table',
+    '[id*="contact"][id*="table"]', '[id*="lead"][id*="table"]',
+  ];
+  for (const sel of known) {
+    const el = document.querySelector(sel);
+    if (el) return el;
+  }
 
-  for (let i = 0; i < 15 && el; i++) {
-    const tag = el.tagName?.toUpperCase();
-    if (tag === 'TR') return el;
-    // For div-based layouts, look for rows that are wide and contain enough data
-    if (tag === 'DIV' || tag === 'LI') {
-      const cells = el.querySelectorAll('td, th, [class*="col"], [class*="cell"]');
-      if (cells.length >= 2) return el;
-      // Large div with enough text content
-      if ((el.textContent?.length ?? 0) > 40 &&
-          el.children.length >= 2) return el;
+  // Find the table with the most rows containing phone numbers
+  let best: Element | null = null;
+  let bestCount = 0;
+
+  for (const table of document.querySelectorAll('table')) {
+    // Skip tables in header, sidebar, nav
+    if (table.closest('header, nav, footer, .sidebar, [class*="header"], [class*="nav"], [id*="header"]')) continue;
+
+    let count = 0;
+    for (const tr of table.querySelectorAll('tr')) {
+      if (PHONE_RE.test(tr.textContent ?? '')) count++;
     }
-    el = el.parentElement;
+    if (count > bestCount) {
+      bestCount = count;
+      best = table;
+    }
   }
-  return null;
+
+  return best;
 }
+
+// ─── Extract a single TR row ──────────────────────────────────────────────────
 
 /**
- * Given a row element, extract all meaningful text columns.
- * Returns an array of { text, el } tuples ordered by visual position.
+ * IndiaMART Lead Manager column order (0-indexed TD):
+ *   0 = Checkbox
+ *   1 = Star
+ *   2 = SENDER (name + phone)     ← phone must be here
+ *   3 = REQUIREMENT (product/qty)
+ *   4 = LABELS
+ *   5 = NOTES                     ← "Add note" noise, skip
+ *   6 = REMINDERS                 ← "Tomorrow 10:00", skip
+ *   7 = MESSAGES
+ *   8 = LOCATION
+ *   9 = ACTIONS                   ← buttons, skip
+ *  10 = SOURCE
+ *  11 = DATE/TIME
+ *
+ * We detect which TD is the SENDER by finding the first TD (index 0-3)
+ * that contains a phone number and does NOT contain noise text.
+ * All other columns are resolved by offset from the sender index.
  */
-function getCells(row: Element): { text: string; el: Element }[] {
-  // Prefer explicit TDs
-  const tds = Array.from(row.querySelectorAll('td'));
-  if (tds.length >= 2) {
-    return tds.map((el) => ({ text: el.textContent?.trim() ?? '', el }));
+function extractRow(tr: Element): Lead | null {
+  const cells = Array.from(tr.querySelectorAll('td'));
+  if (cells.length < 4) return null;
+
+  // ── Find sender cell (must be in first 3 TDs) ─────────────────────────────
+  let senderIdx = -1;
+  let mobile: string | null = null;
+
+  for (let i = 0; i <= Math.min(3, cells.length - 1); i++) {
+    const cellText = cells[i].textContent ?? '';
+    const phone    = extractPhoneFrom(cellText);
+    if (phone && !isNoiseText(cellText)) {
+      senderIdx = i;
+      mobile    = phone;
+      break;
+    }
   }
-  // Div / span children
-  const children = Array.from(row.children).filter((c) => {
-    const t = (c.textContent ?? '').trim();
-    return t.length > 0 && c.tagName !== 'INPUT' && c.tagName !== 'BUTTON';
-  });
-  return children.map((el) => ({ text: el.textContent?.trim() ?? '', el }));
-}
 
-export function extractLeadManagerPage(): Lead[] {
-  const leads: Lead[] = [];
-  const seenPhones = new Set<string>();
+  if (senderIdx === -1) return null; // No valid phone in sender area
 
-  // ── Walk all text nodes looking for phone numbers ─────────────────────────
-  const walker = document.createTreeWalker(
-    document.body,
-    NodeFilter.SHOW_TEXT,
+  // ── Extract name from sender cell ─────────────────────────────────────────
+  // Name is the text in the cell MINUS the phone number and noise
+  const senderRaw = (cells[senderIdx].textContent ?? '').trim();
+  const buyerName = clean(
+    senderRaw
+      .replace(PHONE_RE, '')
+      .replace(/GST/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .split('\n')[0]
   );
 
-  let textNode: Node | null;
-  while ((textNode = walker.nextNode()) !== null) {
-    const text = textNode.textContent ?? '';
-    PHONE_RE.lastIndex = 0;
-    if (!PHONE_RE.test(text)) continue;
+  // ── Column offsets from sender index ──────────────────────────────────────
+  // Based on the known Lead Manager column order
+  const off = (offset: number): string | null => {
+    const idx = senderIdx + offset;
+    if (idx < 0 || idx >= cells.length) return null;
+    const text = (cells[idx].textContent ?? '').trim();
+    return text && !isNoiseText(text) ? clean(text) : null;
+  };
 
-    const phone = extractPhone(text);
-    if (!phone || seenPhones.has(phone)) continue;
-    seenPhones.add(phone);
+  const product     = off(1);  // REQUIREMENT
+  // LABELS (offset 2) — extract badge text
+  const labelEls    = cells[senderIdx + 2]?.querySelectorAll('[class*="badge"],[class*="label"],[class*="tag"],[class*="chip"]') ?? [];
+  const labels      = labelEls.length
+    ? Array.from(labelEls).map((e) => e.textContent?.trim()).filter(Boolean).join(', ') || null
+    : off(2);
 
-    const row = findRow(textNode);
-    if (!row) continue;
+  // Skip NOTES (offset 3) and REMINDERS (offset 4) — always noise
+  const messageRaw  = off(5);  // MESSAGES
+  const city        = off(6);  // LOCATION
 
-    const cells = getCells(row);
-    if (cells.length < 2) continue;
+  // SOURCE (offset 8, skipping ACTIONS at 7)
+  const srcRaw8     = off(8);
+  const srcRaw7     = off(7);
+  const source      = SOURCE_RE.test(srcRaw8 ?? '') ? srcRaw8
+                    : SOURCE_RE.test(srcRaw7 ?? '') ? srcRaw7
+                    : null;
 
-    // ── Extract fields from cells ──────────────────────────────────────────
-    // The sender cell will contain both name and phone. Find it first.
-    let buyerName: string | null = null;
-    let mobile:    string | null = phone;
-    let product:   string | null = null;
-    let message:   string | null = null;
-    let city:      string | null = null;
-    let source:    string | null = null;
-    let leadDate:  string | null = null;
-    let labels:    string | null = null;
+  // DATE (offset 9 or 10)
+  const dateRaw9    = off(9);
+  const dateRaw10   = off(10);
+  const leadDate    = DATE_RE.test(dateRaw10 ?? '') ? dateRaw10
+                    : DATE_RE.test(dateRaw9  ?? '') ? dateRaw9
+                    : null;
 
-    // Heuristic: identify each cell by its content characteristics
-    for (const { text: ct, el } of cells) {
-      if (!ct) continue;
+  // Link for sourceUrl
+  const anchor      = tr.querySelector<HTMLAnchorElement>('a[href*="messagecentre"],a[href*="lead"],a[href*="contact"]');
 
-      // Phone-containing cell → sender
-      PHONE_RE.lastIndex = 0;
-      if (PHONE_RE.test(ct) && !buyerName) {
-        // Extract name: text before/after the phone number
-        PHONE_RE.lastIndex = 0;
-        const name = ct.replace(PHONE_RE, '').replace(/\s+/g, ' ').trim();
-        buyerName = clean(name.split('\n')[0]);
-        continue;
-      }
+  return {
+    buyerName:   buyerName || null,
+    company:     null,
+    mobile,
+    email:       null,
+    product,
+    quantity:    null,
+    requirement: messageRaw,
+    city,
+    state:       null,
+    budget:      null,
+    source,
+    leadDate,
+    labels:      labels || null,
+    sourceUrl:   anchor?.href ?? window.location.href,
+  };
+}
 
-      // Short cell that matches source types
-      if (/^(buylead|direct|other|catalog link|catalogue link)$/i.test(ct.trim())) {
-        source = clean(ct); continue;
-      }
+// ─── Public: extract all leads on the current page ───────────────────────────
 
-      // Date-like cell
-      if (/\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)|\d{2}[\/\-]\d{2}[\/\-]\d{2,4}|\d{2}:\d{2}/i.test(ct)) {
-        leadDate = leadDate ?? clean(ct); continue;
-      }
-
-      // Label-like cells (short, coloured, badge-like)
-      if (el.querySelectorAll('[class*="badge"], [class*="label"], [class*="tag"]').length > 0) {
-        labels = labels ?? clean(ct); continue;
-      }
-
-      // City: usually short (1-3 words), no numbers, comes after message
-      if (!city && ct.length < 40 && /^[A-Za-z\s]+$/.test(ct.trim()) &&
-          product && message) {
-        city = clean(ct); continue;
-      }
-
-      // Long text → message preview
-      if (!message && ct.length > 20 && (product || buyerName)) {
-        message = clean(ct, 300); continue;
-      }
-
-      // Medium text → product / requirement
-      if (!product && ct.length > 5 && ct.length < 200) {
-        product = clean(ct); continue;
-      }
-    }
-
-    // Only add if we have at least a phone or name
-    if (!mobile && !buyerName) continue;
-
-    // Try to get link for sourceUrl
-    const anchor = row.querySelector<HTMLAnchorElement>('a[href]');
-
-    leads.push({
-      buyerName,
-      company:     null,
-      mobile,
-      email:       null,
-      product,
-      quantity:    null,
-      requirement: message,
-      city,
-      state:       null,
-      budget:      null,
-      source,
-      leadDate,
-      labels,
-      sourceUrl:   anchor?.href ?? window.location.href,
-    });
+export function extractLeadManagerPage(): Lead[] {
+  const table = findLeadsTable();
+  if (!table) {
+    console.warn('[LeadSync] Could not find leads table. Will retry with API data.');
+    return [];
   }
 
-  console.log(`[LeadSync] DOM fallback found ${leads.length} leads`);
+  const rows = Array.from(table.querySelectorAll('tr'));
+  const leads: Lead[] = [];
+  const seen  = new Set<string>();
+
+  for (const tr of rows) {
+    // Skip header rows (TH cells)
+    if (tr.querySelector('th')) continue;
+    // Skip rows without enough cells
+    if (tr.querySelectorAll('td').length < 4) continue;
+
+    try {
+      const lead = extractRow(tr);
+      if (!lead) continue;
+
+      // Dedup by phone within this page
+      const key = lead.mobile ?? `${lead.buyerName}|${lead.product}`;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      leads.push(lead);
+    } catch { continue; }
+  }
+
+  console.log(`[LeadSync] DOM extracted ${leads.length} leads from ${rows.length} rows`);
   return leads;
 }
 
 // ─── Pagination ───────────────────────────────────────────────────────────────
 
-const NEXT_BTN_SELECTORS = [
-  'a[title="Next"]',
-  'a[aria-label="Next"]',
+const NEXT_SELECTORS = [
+  'a[title="Next"]', 'a[aria-label="Next"]',
   '.pagination .next:not(.disabled)',
   '.pagination li.next:not(.disabled) a',
-  'li.next:not(.disabled) a',
-  '.next-page:not(.disabled)',
-  'button[aria-label="Next Page"]',
-  'a.nextpg',
+  'li.next:not(.disabled) a', '.next-page:not(.disabled)',
+  'a.nextpg', 'button[aria-label="Next Page"]',
 ];
 
 export function findNextButton(): HTMLElement | null {
-  for (const sel of NEXT_BTN_SELECTORS) {
+  for (const sel of NEXT_SELECTORS) {
     const el = document.querySelector<HTMLElement>(sel);
     if (el) return el;
   }
-  // Text-based fallback
-  for (const el of document.querySelectorAll<HTMLElement>('a, button')) {
+  return Array.from(document.querySelectorAll<HTMLElement>('a, button')).find((el) => {
     const txt = (el.textContent ?? '').trim().toLowerCase();
-    if ((txt === 'next' || txt === '›' || txt === '»' || txt === 'next >') &&
-        !el.classList.contains('disabled') && !el.hasAttribute('disabled')) {
-      return el;
-    }
-  }
-  return null;
-}
-
-export function waitForPageChange(
-  prevSignature: string,
-  timeoutMs = 10_000,
-): Promise<boolean> {
-  return new Promise((resolve) => {
-    const observer = new MutationObserver(() => {
-      const sig = (document.querySelector('body')?.textContent ?? '').substring(0, 200);
-      if (sig !== prevSignature) {
-        observer.disconnect();
-        resolve(true);
-      }
-    });
-    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
-    setTimeout(() => { observer.disconnect(); resolve(false); }, timeoutMs);
-  });
+    return (txt === 'next' || txt === '›' || txt === '»' || txt === 'next >') &&
+           !el.classList.contains('disabled') && !el.hasAttribute('disabled');
+  }) ?? null;
 }
 
 export function getPageSignature(): string {
-  return (document.body?.textContent ?? '').substring(0, 200);
+  return (document.body?.textContent ?? '').substring(50, 300);
+}
+
+export function waitForPageChange(prev: string, timeoutMs = 10_000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const ob = new MutationObserver(() => {
+      const sig = (document.body?.textContent ?? '').substring(50, 300);
+      if (sig !== prev) { ob.disconnect(); resolve(true); }
+    });
+    ob.observe(document.body, { childList: true, subtree: true, characterData: true });
+    setTimeout(() => { ob.disconnect(); resolve(false); }, timeoutMs);
+  });
 }
