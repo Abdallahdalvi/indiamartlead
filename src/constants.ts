@@ -95,6 +95,3 @@ export const INDIAMART_LEAD_PATTERNS = [
   /my\.indiamart\.com/i,
 ];
 
-/** True if the current page is the Lead Manager list page. */
-export const IS_LEAD_MANAGER =
-  /seller\.indiamart\.com\/messagecentre/i.test(window?.location?.href ?? '');

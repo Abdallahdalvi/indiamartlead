@@ -229,7 +229,6 @@ export function extractRowLead(row: Element): Lead | null {
     source,
     leadDate,
     labels,
-    leadDate2:   undefined,
     sourceUrl:   anchor?.href ?? window.location.href,
   };
 }
