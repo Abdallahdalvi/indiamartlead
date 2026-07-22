@@ -143,7 +143,7 @@ export async function startBackgroundBulkSync(): Promise<void> {
         try {
           const checkResp = (await chrome.tabs.sendMessage(tabId, { type: 'EXTRACT_PAGE_LEADS' })) as MessageResponse<Lead[]>;
           const newLeads = checkResp?.data ?? [];
-          if (newLeads.length > 0 && newLeads[0].mobile !== pageLeads[0]?.mobile) {
+          if (newLeads.length > 0 && (newLeads[0].mobile !== pageLeads[0]?.mobile || newLeads.length > pageLeads.length)) {
             pageChanged = true;
             break;
           }

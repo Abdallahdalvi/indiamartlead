@@ -61,17 +61,17 @@ export async function syncLead(lead: Lead): Promise<SyncResult> {
     //    I: SourceURL| J: Labels      | K: Imported At
     const importedAt = new Date().toISOString();
     const rowData: (string | null)[] = [
-      leadId,                      // A: Lead ID
-      lead.buyerName,              // B: Sender
-      lead.mobile,                 // C: Phone
-      lead.product,                // D: Requirement
-      lead.requirement,            // E: Message
-      lead.city,                   // F: Location
-      lead.source ?? null,         // G: Source
-      lead.leadDate,               // H: Date
-      lead.sourceUrl,              // I: Source URL
-      lead.labels ?? null,         // J: Labels
-      importedAt,                  // K: Imported At
+      leadId,                                // A: Lead ID
+      lead.buyerName,                        // B: Sender
+      lead.mobile,                           // C: Phone
+      lead.product || lead.requirement,      // D: Requirement (combine product/requirement)
+      null,                                  // E: Message (Skipped as requested)
+      lead.city,                             // F: Location
+      lead.source ?? null,                   // G: Source
+      lead.leadDate,                         // H: Date
+      lead.sourceUrl,                        // I: Source URL
+      lead.labels ?? null,                   // J: Labels
+      importedAt,                            // K: Imported At
     ];
 
     // 6. Append (INSERT_ROWS — never overwrites)
