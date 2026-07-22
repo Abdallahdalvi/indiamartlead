@@ -239,8 +239,10 @@ export function extractLeadManagerPage(): Lead[] {
 // ─── Pagination ───────────────────────────────────────────────────────────────
 
 const NEXT_SELECTORS = [
-  'a[title="Next"]',
-  'a[aria-label="Next"]',
+  'a[title*="Next"]',
+  'a[aria-label*="Next"]',
+  'button[title*="Next"]',
+  'button[aria-label*="Next"]',
   '.pagination .next:not(.disabled)',
   '.pagination li.next:not(.disabled) a',
   'li.next:not(.disabled) a',
@@ -248,23 +250,55 @@ const NEXT_SELECTORS = [
   'a.nextpg',
   'button[aria-label="Next Page"]',
   '[class*="pagination"] [class*="next"]',
+  '[class*="pagination"] a:last-child',
   '[class*="nextPage"]',
+  '[class*="btn-next"]',
+  '[id*="btnNext"]',
+  '[id*="nextPage"]',
 ];
 
+function isVisible(el: HTMLElement): boolean {
+  if (el.classList.contains('disabled') || el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true') {
+    return false;
+  }
+  const rect = el.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0 && window.getComputedStyle(el).display !== 'none';
+}
+
 export function findNextButton(): HTMLElement | null {
+  // 1. Explicit CSS selectors
   for (const sel of NEXT_SELECTORS) {
     const el = document.querySelector<HTMLElement>(sel);
-    if (el) return el;
+    if (el && isVisible(el)) return el;
   }
 
-  // Text-based fallback: find button/link with text 'Next', '>', '›', '»'
-  const elements = Array.from(document.querySelectorAll<HTMLElement>('a, button, li, span'));
-  for (const el of elements) {
+  // 2. Pagination containers (e.g. "Page 1 >" or "Page 1 of 20")
+  const pageBars = Array.from(document.querySelectorAll<HTMLElement>('[class*="page"], [class*="pagi"], [id*="page"]'));
+  for (const bar of pageBars) {
+    const clickable = bar.querySelectorAll<HTMLElement>('a, button, i, span, svg');
+    for (const c of clickable) {
+      if (!isVisible(c)) continue;
+      const txt = (c.textContent ?? '').trim();
+      const title = (c.getAttribute('title') ?? '').trim();
+      const aria = (c.getAttribute('aria-label') ?? '').trim();
+
+      if (/^(next|>|›|»)$/i.test(txt) || /next|>|›|»/i.test(title) || /next|>|›|»/i.test(aria)) {
+        return c;
+      }
+    }
+  }
+
+  // 3. Global scan for clickable elements containing 'Next', '>', '›', '»'
+  const allClickable = Array.from(document.querySelectorAll<HTMLElement>('a, button, span, div[onclick], div[role="button"]'));
+  for (const el of allClickable) {
+    if (!isVisible(el)) continue;
     const txt = (el.textContent ?? '').trim().toLowerCase();
+    const title = (el.getAttribute('title') ?? '').trim().toLowerCase();
+    const aria = (el.getAttribute('aria-label') ?? '').trim().toLowerCase();
+
     if (
-      (txt === 'next' || txt === '›' || txt === '»' || txt === 'next >' || txt === 'next page') &&
-      !el.classList.contains('disabled') &&
-      !el.hasAttribute('disabled')
+      txt === 'next' || txt === '>' || txt === '›' || txt === '»' || txt === 'next >' ||
+      title.includes('next') || aria.includes('next') || el.className.toLowerCase().includes('next')
     ) {
       return el;
     }
