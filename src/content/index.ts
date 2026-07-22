@@ -1,88 +1,114 @@
 /**
  * Content script entry point (IIFE bundle).
  *
- * Responsibilities:
- *   1. Detect whether we're on the IndiaMART Lead Manager (messagecentre)
- *   2. Extract leads from the current page
- *   3. Auto-paginate through ALL pages to collect all 530 leads
- *   4. Send leads to the background for dedup + Sheet append
- *   5. Report progress back to the popup in real-time
- *   6. Handle single-lead auto-sync on buyer detail pages
- *   7. Listen for SPA navigation (IndiaMART React router)
+ * On seller.indiamart.com/messagecentre (Lead Manager):
+ *   1. Inject XHR/fetch interceptor into page main world
+ *   2. Listen for captured API lead data via window.postMessage
+ *   3. On SYNC_ALL_PAGES: drain captured leads page by page
+ *   4. Auto-paginate: click Next → wait for new API capture → repeat
+ *
+ * On buyer detail / other IndiaMART pages:
+ *   Single-lead extraction + optional auto-sync
  */
 
-import { extractLeadManagerPage, findNextButton, waitForPageChange } from './leadmanager';
+import { injectInterceptor, triggerLeadRefresh } from './pageInjector';
+import {
+  extractLeadManagerPage,
+  findNextButton,
+  waitForPageChange,
+  getPageSignature,
+  setCapturedLeads,
+  getCapturedLeads,
+  clearCapturedLeads,
+} from './leadmanager';
 import { extractLead } from './extractor';
 import { observeNavigation } from './observer';
 import type { Lead, BulkSyncProgress } from '@/types';
 
-// ─── Detect page type ─────────────────────────────────────────────────────────
+// ─── Page detection ───────────────────────────────────────────────────────────
 
 function isLeadManager(): boolean {
   return /seller\.indiamart\.com\/messagecentre/i.test(window.location.href);
 }
 
-// ─── Send a lead to background for sync ──────────────────────────────────────
+// ─── Send lead to background ──────────────────────────────────────────────────
 
-async function syncSingleLead(lead: Lead): Promise<void> {
+async function syncOneToBackground(lead: Lead): Promise<{ status: string } | null> {
   try {
-    await chrome.runtime.sendMessage({ type: 'SYNC_LEAD', payload: lead });
-  } catch (e) {
-    console.warn('[LeadSync] syncSingleLead error:', e);
+    const resp = await chrome.runtime.sendMessage({ type: 'SYNC_LEAD', payload: lead });
+    return resp?.data ?? null;
+  } catch {
+    return null;
   }
 }
 
-// ─── Broadcast current lead to popup / sidepanel ──────────────────────────────
+// ─── Listen for API captures from injected page script ───────────────────────
+// The injected script runs in the MAIN world and posts back here.
 
-async function broadcastLead(lead: Lead): Promise<void> {
-  try {
-    await chrome.runtime.sendMessage({ type: 'LEAD_EXTRACTED', payload: lead });
-  } catch { /* popup may not be open */ }
+let apiLeadsBuffer: Lead[] = [];
+let onApiLeadsCb: (() => void) | null = null;
+
+window.addEventListener('message', (event: MessageEvent) => {
+  if (event.source !== window) return;
+  if (event.data?.type !== 'LEADSYNC_API_LEADS') return;
+
+  const raw: Record<string, unknown>[] = event.data.leads ?? [];
+  if (!raw.length) return;
+
+  console.log(`[LeadSync] API captured ${raw.length} leads from ${event.data.url}`);
+
+  // The injector already parsed them into our Lead shape
+  const leads = raw as unknown as Lead[];
+  apiLeadsBuffer = leads;
+  setCapturedLeads(leads);
+
+  // Notify any waiting bulk-sync that new leads arrived
+  onApiLeadsCb?.();
+  onApiLeadsCb = null;
+});
+
+/** Wait up to `timeoutMs` for the API interceptor to deliver new leads. */
+function waitForApiCapture(timeoutMs = 10_000): Promise<Lead[]> {
+  return new Promise((resolve) => {
+    // If already populated, return immediately
+    if (apiLeadsBuffer.length > 0) {
+      const leads = [...apiLeadsBuffer];
+      apiLeadsBuffer = [];
+      resolve(leads);
+      return;
+    }
+    const timer = setTimeout(() => {
+      onApiLeadsCb = null;
+      resolve([]);
+    }, timeoutMs);
+    onApiLeadsCb = () => {
+      clearTimeout(timer);
+      const leads = [...apiLeadsBuffer];
+      apiLeadsBuffer = [];
+      resolve(leads);
+    };
+  });
 }
 
-// ─── Auto-sync a single detected lead (buyer detail pages) ───────────────────
-
-let lastAutoSyncUrl = '';
-async function runAutoSync(): Promise<void> {
-  if (isLeadManager()) return; // handled separately
-  if (window.location.href === lastAutoSyncUrl) return;
-  lastAutoSyncUrl = window.location.href;
-
-  const lead = await extractLead();
-  if (!lead) return;
-
-  await broadcastLead(lead);
-
-  // Check if auto-sync is enabled
-  const config = await chrome.runtime.sendMessage({ type: 'GET_CONFIG' });
-  if (config?.data?.autoSync) {
-    await chrome.runtime.sendMessage({ type: 'AUTO_SYNC_TRIGGERED', payload: lead });
-  }
-}
-
-// ─── Bulk sync ALL pages of the Lead Manager ─────────────────────────────────
+// ─── Bulk sync: all pages ─────────────────────────────────────────────────────
 
 let bulkSyncRunning = false;
 
 async function runBulkSync(): Promise<void> {
-  if (bulkSyncRunning) {
-    console.log('[LeadSync] Bulk sync already running, ignoring.');
-    return;
-  }
+  if (bulkSyncRunning) return;
   bulkSyncRunning = true;
-
-  console.log('[LeadSync] Starting bulk sync of all Lead Manager pages...');
+  clearCapturedLeads();
+  apiLeadsBuffer = [];
 
   let page        = 1;
   let totalSynced = 0;
   let imported    = 0;
   let duplicates  = 0;
   let errors      = 0;
-  const allLeads: Lead[] = [];
 
   const sendProgress = (done: boolean) => {
     const progress: BulkSyncProgress = {
-      total:      530,   // shown as estimate; updated as we go
+      total:      530,
       current:    totalSynced,
       imported,
       duplicates,
@@ -92,83 +118,98 @@ async function runBulkSync(): Promise<void> {
     };
     chrome.runtime.sendMessage({ type: 'BULK_SYNC_PROGRESS', payload: progress }).catch(() => {});
     chrome.storage.local.set({ leadsync_bulk_progress: progress });
+    console.log(`[LeadSync] Page ${page} — synced:${totalSynced} imported:${imported} dup:${duplicates}`);
   };
 
   try {
     while (true) {
-      // ── Extract leads from current page ──────────────────────────────────
-      const pageLeads = extractLeadManagerPage();
-      console.log(`[LeadSync] Page ${page}: found ${pageLeads.length} leads`);
+      // ── Get leads for this page ─────────────────────────────────────────
+      let pageLeads: Lead[] = [];
+
+      // Try API capture first (reliable)
+      // Trigger a refresh to force a new API call for the current page
+      triggerLeadRefresh();
+      const apiLeads = await waitForApiCapture(8_000);
+
+      if (apiLeads.length > 0) {
+        pageLeads = apiLeads;
+        console.log(`[LeadSync] Page ${page}: API gave ${pageLeads.length} leads`);
+      } else {
+        // Fallback: DOM phone-number walk
+        pageLeads = extractLeadManagerPage();
+        console.log(`[LeadSync] Page ${page}: DOM fallback gave ${pageLeads.length} leads`);
+      }
 
       if (pageLeads.length === 0) {
-        console.log('[LeadSync] No leads found on this page, stopping.');
+        console.log('[LeadSync] No leads on this page, stopping.');
         break;
       }
 
-      // ── Sync each lead on this page ───────────────────────────────────────
+      // ── Sync each lead ─────────────────────────────────────────────────
       for (const lead of pageLeads) {
-        try {
-          const resp = await chrome.runtime.sendMessage({ type: 'SYNC_LEAD', payload: lead });
-          const result = resp?.data;
-          if (result?.status === 'imported')  imported++;
-          else if (result?.status === 'duplicate') duplicates++;
-          else errors++;
-          totalSynced++;
-          allLeads.push(lead);
-        } catch {
-          errors++;
-          totalSynced++;
-        }
+        const result = await syncOneToBackground(lead);
+        const status = result?.status ?? 'error';
+        if (status === 'imported')  imported++;
+        else if (status === 'duplicate') duplicates++;
+        else errors++;
+        totalSynced++;
 
-        // Small delay between leads to avoid API rate limits
+        // Rate limit: 150ms between rows
         await new Promise<void>((r) => setTimeout(r, 150));
       }
 
       sendProgress(false);
 
-      // ── Try to go to next page ───────────────────────────────────────────
-      const firstRowText = (document.querySelector('tr[data-uid], tr[data-gid], tbody tr')
-        ?.textContent ?? '') + page;
-
+      // ── Paginate ────────────────────────────────────────────────────────
+      const sig = getPageSignature();
       const nextBtn = findNextButton();
       if (!nextBtn) {
-        console.log('[LeadSync] No next page button found. All pages done.');
+        console.log('[LeadSync] No next page button, done.');
         break;
       }
 
-      console.log(`[LeadSync] Navigating to page ${page + 1}...`);
+      // Clear buffer before clicking next so we wait for new capture
+      apiLeadsBuffer = [];
+
       nextBtn.click();
-
-      // Wait for DOM to update with new page content
-      const changed = await waitForPageChange(firstRowText, 10_000);
+      const changed = await waitForPageChange(sig, 10_000);
       if (!changed) {
-        console.log('[LeadSync] Page did not change after 10s, stopping.');
+        console.log('[LeadSync] Page did not update after 10s, stopping.');
         break;
       }
 
+      // Wait a bit for the page's own API call to fire
+      await new Promise<void>((r) => setTimeout(r, 1_500));
       page++;
-
-      // Safety: stop after 50 pages (1000+ leads) to prevent runaway
-      if (page > 50) break;
+      if (page > 50) break; // safety cap
     }
   } finally {
     bulkSyncRunning = false;
     sendProgress(true);
-    console.log(
-      `[LeadSync] Bulk sync complete. Pages: ${page}, ` +
-      `Imported: ${imported}, Duplicates: ${duplicates}, Errors: ${errors}`
-    );
   }
 }
 
-// ─── Extract current page leads (for popup "Sync All Visible Leads") ─────────
+// ─── Single-lead auto-sync (buyer detail pages) ───────────────────────────────
 
-function extractCurrentPage(): Lead[] {
-  if (isLeadManager()) return extractLeadManagerPage();
-  return [];
+let lastAutoSyncUrl = '';
+async function runAutoSync(): Promise<void> {
+  if (isLeadManager()) return;
+  if (window.location.href === lastAutoSyncUrl) return;
+  lastAutoSyncUrl = window.location.href;
+
+  const lead = await extractLead();
+  if (!lead) return;
+
+  try {
+    await chrome.runtime.sendMessage({ type: 'LEAD_EXTRACTED', payload: lead });
+    const config = await chrome.runtime.sendMessage({ type: 'GET_CONFIG' });
+    if (config?.data?.autoSync) {
+      await chrome.runtime.sendMessage({ type: 'AUTO_SYNC_TRIGGERED', payload: lead });
+    }
+  } catch { /* popup not open */ }
 }
 
-// ─── Message handler ──────────────────────────────────────────────────────────
+// ─── Message listener ─────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   const type = message?.type;
@@ -177,9 +218,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     (async () => {
       if (isLeadManager()) {
         const leads = extractLeadManagerPage();
-        const first = leads[0] ?? null;
-        if (first) broadcastLead(first);
-        sendResponse({ success: true, data: first });
+        sendResponse({ success: true, data: leads[0] ?? null });
       } else {
         const lead = await extractLead();
         sendResponse({ success: true, data: lead });
@@ -188,23 +227,21 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
-  if (type === 'SYNC_ALL_LEADS') {
-    // Sync only the current visible page
-    (async () => {
-      const leads = extractCurrentPage();
-      sendResponse({ success: true, data: { total: leads.length } });
-      for (const lead of leads) {
-        await syncSingleLead(lead);
-        await new Promise<void>((r) => setTimeout(r, 150));
-      }
-    })();
+  if (type === 'SYNC_ALL_PAGES') {
+    runBulkSync().catch(console.error);
+    sendResponse({ success: true, data: { started: true } });
     return true;
   }
 
-  if (type === 'SYNC_ALL_PAGES') {
-    // Bulk sync ALL pages (the 530-lead sync)
-    runBulkSync().catch(console.error);
-    sendResponse({ success: true, data: { started: true } });
+  if (type === 'SYNC_ALL_LEADS') {
+    (async () => {
+      const leads = extractLeadManagerPage();
+      sendResponse({ success: true, data: { total: leads.length } });
+      for (const lead of leads) {
+        await syncOneToBackground(lead);
+        await new Promise<void>((r) => setTimeout(r, 150));
+      }
+    })();
     return true;
   }
 
@@ -215,23 +252,24 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 function init(): void {
   if (isLeadManager()) {
-    console.log('[LeadSync] Lead Manager detected. Ready for bulk sync.');
-    // Extract first page and broadcast so popup shows live count
+    // Inject API interceptor into the page's main world
+    injectInterceptor();
+    console.log('[LeadSync] Lead Manager ready. API interceptor injected.');
+
+    // Log how many leads are visible via DOM as a sanity check
     setTimeout(() => {
-      const leads = extractLeadManagerPage();
-      if (leads[0]) broadcastLead(leads[0]);
-      console.log(`[LeadSync] Found ${leads.length} leads on current page.`);
-    }, 1500);
+      const domLeads = extractLeadManagerPage();
+      console.log(`[LeadSync] DOM sanity check: ${domLeads.length} leads visible on page 1.`);
+    }, 2_000);
   } else {
-    // Buyer detail page — auto-extract
-    setTimeout(runAutoSync, 1000);
+    setTimeout(runAutoSync, 1_000);
   }
 }
 
-// Start and watch SPA navigation
 init();
 observeNavigation(() => {
   setTimeout(() => {
     if (!isLeadManager()) runAutoSync();
-  }, 1200);
+    else injectInterceptor(); // Re-inject after SPA navigation
+  }, 1_200);
 });
