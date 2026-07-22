@@ -2,16 +2,16 @@
  * Content script entry point (IIFE bundle).
  *
  * On seller.indiamart.com/messagecentre (Lead Manager):
- *   1. Inject XHR/fetch interceptor into page main world
- *   2. Listen for captured API lead data via window.postMessage
- *   3. On SYNC_ALL_PAGES: drain captured leads page by page
- *   4. Auto-paginate: click Next → wait for new API capture → repeat
+ *   1. Ask background to inject the XHR/fetch interceptor via
+ *      chrome.scripting.executeScript({ world: 'MAIN' }) — CSP-safe.
+ *   2. Listen for captured API lead data via window.postMessage.
+ *   3. On SYNC_ALL_PAGES: sync leads page by page with auto-pagination.
  *
  * On buyer detail / other IndiaMART pages:
- *   Single-lead extraction + optional auto-sync
+ *   Single-lead extraction + optional auto-sync.
  */
 
-import { injectInterceptor, triggerLeadRefresh } from './pageInjector';
+import { triggerLeadRefresh } from './pageInjector';
 import {
   extractLeadManagerPage,
   findNextButton,
@@ -25,7 +25,20 @@ import { extractLead } from './extractor';
 import { observeNavigation } from './observer';
 import type { Lead, BulkSyncProgress } from '@/types';
 
-// ─── Page detection ───────────────────────────────────────────────────────────
+// ─── Inject interceptor via background (CSP-safe) ───────────────────────────
+// IndiaMART has a strict CSP that blocks inline <script> tags.
+// We ask the background worker to call chrome.scripting.executeScript
+// with world:'MAIN' which Chrome injects natively — bypasses CSP.
+
+async function injectViaBackground(): Promise<void> {
+  try {
+    await chrome.runtime.sendMessage({ type: 'INJECT_INTERCEPTOR' });
+    console.log('[LeadSync] Interceptor injection requested.');
+  } catch (e) {
+    console.warn('[LeadSync] Could not inject interceptor:', e);
+  }
+}
+
 
 function isLeadManager(): boolean {
   return /seller\.indiamart\.com\/messagecentre/i.test(window.location.href);
@@ -252,15 +265,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 function init(): void {
   if (isLeadManager()) {
-    // Inject API interceptor into the page's main world
-    injectInterceptor();
-    console.log('[LeadSync] Lead Manager ready. API interceptor injected.');
-
-    // Log how many leads are visible via DOM as a sanity check
-    setTimeout(() => {
-      const domLeads = extractLeadManagerPage();
-      console.log(`[LeadSync] DOM sanity check: ${domLeads.length} leads visible on page 1.`);
-    }, 2_000);
+    // Ask background to inject interceptor into MAIN world (CSP-safe)
+    injectViaBackground().then(() => {
+      console.log('[LeadSync] Lead Manager ready.');
+      // Sanity check: how many rows does DOM see?
+      setTimeout(() => {
+        const domLeads = extractLeadManagerPage();
+        console.log(`[LeadSync] DOM sanity check: ${domLeads.length} leads on page 1.`);
+      }, 2_000);
+    });
   } else {
     setTimeout(runAutoSync, 1_000);
   }
@@ -269,7 +282,7 @@ function init(): void {
 init();
 observeNavigation(() => {
   setTimeout(() => {
-    if (!isLeadManager()) runAutoSync();
-    else injectInterceptor(); // Re-inject after SPA navigation
+    if (isLeadManager()) injectViaBackground();
+    else runAutoSync();
   }, 1_200);
 });

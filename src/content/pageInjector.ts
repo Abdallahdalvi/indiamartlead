@@ -1,192 +1,175 @@
 /**
  * pageInjector.ts
  *
- * Injects into the PAGE's MAIN world to intercept fetch() + XHR.
- * Captures ANY JSON response that contains an array of lead-like objects.
- * No URL filtering — IndiaMART's API URL may vary; we detect by content.
+ * IMPORTANT: IndiaMART uses a strict CSP that blocks inline <script> injection.
+ * Instead, we export a standalone function that the BACKGROUND worker injects
+ * via chrome.scripting.executeScript({ world: 'MAIN' }) — this is CSP-safe
+ * because Chrome injects it natively, not as an inline script.
+ *
+ * The function must be 100% self-contained (no outer scope references)
+ * because chrome.scripting serializes it with .toString().
  */
 
-const INJECTOR_CODE = /* javascript */ `
-(function () {
-  if (window.__leadsyncInjected) return;
-  window.__leadsyncInjected = true;
+/**
+ * This function runs in the PAGE'S MAIN WORLD (not the content script isolated
+ * world). It patches window.fetch and XMLHttpRequest, captures JSON responses
+ * that look like lead data, and relays them to the content script via
+ * window.postMessage.
+ *
+ * DO NOT reference any variables outside this function — it runs in isolation.
+ */
+export function leadsyncInterceptorMain(): void {
+  const win = window as Window & { __leadsyncInjected?: boolean };
+  if (win.__leadsyncInjected) return;
+  win.__leadsyncInjected = true;
 
-  var KNOWN_NAME_FIELDS   = ['glusr_cntct_nm','contact_name','name','sender_name','cntct_nm','buyer_name','cname','ContactName'];
-  var KNOWN_MOBILE_FIELDS = ['cntct_mob','mobile','phone','contact_mobile','mob','Mobile','ContactMobile','mobileNo'];
-  var KNOWN_PROD_FIELDS   = ['prod_desc','product','requirement','req','prd_desc','Product','Requirement','prodDesc'];
-  var KNOWN_MSG_FIELDS    = ['msg','message','last_msg','lastMessage','inq_msg','query','Msg','Message'];
-  var KNOWN_CITY_FIELDS   = ['glusr_city_nm','city','location','city_nm','City','Location'];
-  var KNOWN_SRC_FIELDS    = ['src_type','source','lead_source','srctype','lsrc','Source','LeadSource'];
-  var KNOWN_DATE_FIELDS   = ['msgdt','date','created_at','dt','msg_dt','lead_date','Date','LeadDate','adddt'];
-  var KNOWN_LABEL_FIELDS  = ['label_nm','labels','label','tag','Labels','Label'];
+  const NAME_FIELDS   = ['glusr_cntct_nm','contact_name','name','sender_name','cntct_nm','buyer_name','cname','ContactName','CONTACT_NAME'];
+  const MOBILE_FIELDS = ['cntct_mob','mobile','phone','contact_mobile','mob','Mobile','ContactMobile','mobileNo','MOBILE','contact_mobile_enc'];
+  const PROD_FIELDS   = ['prod_desc','product','requirement','req','prd_desc','Product','Requirement','prodDesc','PROD_DESC'];
+  const MSG_FIELDS    = ['msg','message','last_msg','lastMessage','inq_msg','query','Msg','Message','MSG','last_message','LAST_MSG'];
+  const CITY_FIELDS   = ['glusr_city_nm','city','location','city_nm','City','Location','CITY'];
+  const SRC_FIELDS    = ['src_type','source','lead_source','srctype','lsrc','Source','LeadSource','SRC_TYPE','SOURCE'];
+  const DATE_FIELDS   = ['msgdt','date','created_at','dt','msg_dt','lead_date','Date','LeadDate','adddt','MSGDT','DATE','msg_date'];
+  const LABEL_FIELDS  = ['label_nm','labels','label','tag','Labels','Label','LABEL'];
 
-  function first(obj, fields) {
-    for (var i = 0; i < fields.length; i++) {
-      var v = obj[fields[i]];
-      if (v !== null && v !== undefined && String(v).trim()) return String(v).trim();
+  function getField(obj: Record<string, unknown>, fields: string[]): string | null {
+    for (const f of fields) {
+      const v = obj[f];
+      if (v !== null && v !== undefined) {
+        const s = String(v).trim();
+        if (s) return s;
+      }
     }
-    // fallback: scan all keys case-insensitively
-    var keys = Object.keys(obj);
-    for (var j = 0; j < fields.length; j++) {
-      var f = fields[j].toLowerCase();
-      for (var k = 0; k < keys.length; k++) {
-        if (keys[k].toLowerCase() === f && obj[keys[k]] !== null && obj[keys[k]] !== undefined) {
-          return String(obj[keys[k]]).trim() || null;
+    // Case-insensitive scan
+    const keys = Object.keys(obj);
+    for (const f of fields) {
+      const fl = f.toLowerCase();
+      for (const k of keys) {
+        if (k.toLowerCase() === fl && obj[k] != null) {
+          const s = String(obj[k]).trim();
+          if (s) return s;
         }
       }
     }
     return null;
   }
 
-  function looksLikeLead(obj) {
+  function isLead(obj: unknown): boolean {
     if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
-    var keys = Object.keys(obj);
-    var hasName   = keys.some(function(k){ return /name|nm|cntct|sender/i.test(k); });
-    var hasMobile = keys.some(function(k){ return /mob|phone|contact|cntct/i.test(k); });
-    return hasName || hasMobile;
+    const keys = Object.keys(obj as object);
+    return keys.some((k) => /name|nm|cntct|sender|mob|phone|contact/i.test(k));
   }
 
-  function parseLead(obj) {
+  function parseLead(obj: Record<string, unknown>) {
     return {
-      buyerName:   first(obj, KNOWN_NAME_FIELDS),
-      mobile:      first(obj, KNOWN_MOBILE_FIELDS),
-      product:     first(obj, KNOWN_PROD_FIELDS),
-      requirement: first(obj, KNOWN_MSG_FIELDS),
-      city:        first(obj, KNOWN_CITY_FIELDS),
-      source:      first(obj, KNOWN_SRC_FIELDS),
-      leadDate:    first(obj, KNOWN_DATE_FIELDS),
-      labels:      first(obj, KNOWN_LABEL_FIELDS),
-      quantity:    first(obj, ['qty','quantity']),
-      company:     first(obj, ['glusr_cmpny_nm','company','Company']),
-      email:       first(obj, ['email','cntct_email','Email']),
-      state:       first(obj, ['state','glusr_state_nm','State']),
-      budget:      null,
+      buyerName:   getField(obj, NAME_FIELDS),
+      mobile:      getField(obj, MOBILE_FIELDS),
+      product:     getField(obj, PROD_FIELDS),
+      requirement: getField(obj, MSG_FIELDS),
+      city:        getField(obj, CITY_FIELDS),
+      source:      getField(obj, SRC_FIELDS),
+      leadDate:    getField(obj, DATE_FIELDS),
+      labels:      getField(obj, LABEL_FIELDS),
+      quantity:    getField(obj, ['qty', 'quantity', 'QTY']),
+      company:     getField(obj, ['glusr_cmpny_nm', 'company', 'Company', 'COMPANY']),
+      email:       getField(obj, ['email', 'cntct_email', 'Email', 'EMAIL']),
+      state:       getField(obj, ['state', 'glusr_state_nm', 'State', 'STATE']),
+      budget:      null as null,
       sourceUrl:   window.location.href,
     };
   }
 
-  function tryExtract(data) {
-    if (!data) return null;
+  function extractLeads(data: unknown): ReturnType<typeof parseLead>[] | null {
+    if (!data || typeof data !== 'object') return null;
 
-    var candidates = [
-      data, data.data, data.DATA, data.result, data.results,
-      data.response, data.RESPONSE, data.contacts, data.Contacts,
-      data.leads, data.Leads, data.rows, data.list, data.items,
-      data.records, data.Contact, data.payload, data.body,
-    ].filter(function(x){ return x != null; });
+    const d = data as Record<string, unknown>;
+    const candidates = [
+      data, d['data'], d['DATA'], d['result'], d['results'],
+      d['response'], d['RESPONSE'], d['contacts'], d['Contacts'],
+      d['leads'], d['Leads'], d['rows'], d['list'], d['items'],
+      d['records'], d['Contact'], d['payload'], d['body'],
+      d['contact_list'], d['contactList'], d['lead_list'],
+    ].filter((x) => x != null);
 
-    for (var i = 0; i < candidates.length; i++) {
-      var c = candidates[i];
-
-      // Direct array of lead objects
-      if (Array.isArray(c) && c.length > 0 && looksLikeLead(c[0])) {
-        var parsed = c.map(parseLead).filter(function(l){ return l.buyerName || l.mobile; });
-        if (parsed.length > 0) return parsed;
+    for (const c of candidates) {
+      if (Array.isArray(c) && c.length > 0 && isLead(c[0])) {
+        const leads = (c as Record<string, unknown>[])
+          .map(parseLead)
+          .filter((l) => l.buyerName || l.mobile);
+        if (leads.length > 0) return leads;
       }
 
-      // Nested: { "0":{...}, "1":{...} } style
       if (c && typeof c === 'object' && !Array.isArray(c)) {
-        var vals = Object.values(c);
-        if (vals.length >= 5 && looksLikeLead(vals[0])) {
-          var parsed2 = vals.map(parseLead).filter(function(l){ return l.buyerName || l.mobile; });
-          if (parsed2.length > 0) return parsed2;
+        const vals = Object.values(c as object);
+        if (vals.length >= 3 && isLead(vals[0])) {
+          const leads = (vals as Record<string, unknown>[])
+            .map(parseLead)
+            .filter((l) => l.buyerName || l.mobile);
+          if (leads.length > 0) return leads;
         }
       }
     }
     return null;
   }
 
-  function handleResponse(url, data) {
-    var leads = tryExtract(data);
+  function handleData(url: string, data: unknown): void {
+    const leads = extractLeads(data);
     if (!leads || leads.length === 0) return;
-
     console.log('[LeadSync] Captured', leads.length, 'leads from:', url);
-    window.postMessage({ type: 'LEADSYNC_API_LEADS', leads: leads, url: url }, '*');
+    window.postMessage({ type: 'LEADSYNC_API_LEADS', leads, url }, '*');
   }
 
-  function safeParse(text) {
+  function safeParse(text: string): unknown {
     if (!text) return null;
-    var t = text.trimStart();
+    const t = text.trimStart();
     if (t[0] !== '{' && t[0] !== '[') return null;
-    try { return JSON.parse(text); } catch(e) { return null; }
+    try { return JSON.parse(text); } catch { return null; }
   }
 
-  // ── Intercept fetch ──────────────────────────────────────────────────────
-  var origFetch = window.fetch;
-  window.fetch = function() {
-    var url = '';
-    if (typeof arguments[0] === 'string') url = arguments[0];
-    else if (arguments[0] && arguments[0].url) url = arguments[0].url;
-
-    return origFetch.apply(this, arguments).then(function(resp) {
-      var contentType = resp.headers ? resp.headers.get('content-type') || '' : '';
-      if (contentType.indexOf('json') !== -1 || url.indexOf('.json') !== -1) {
-        resp.clone().text().then(function(text) {
-          var data = safeParse(text);
-          if (data) handleResponse(url, data);
-        }).catch(function(){});
-      }
+  // ── Patch fetch ────────────────────────────────────────────────────────────
+  const origFetch = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    const url = typeof input === 'string' ? input : (input as Request).url ?? '';
+    return origFetch(input, init).then((resp) => {
+      resp.clone().text().then((text) => {
+        const data = safeParse(text);
+        if (data) handleData(url, data);
+      }).catch(() => {});
       return resp;
     });
   };
 
-  // ── Intercept XHR ────────────────────────────────────────────────────────
-  var origOpen = XMLHttpRequest.prototype.open;
-  var origSend = XMLHttpRequest.prototype.send;
+  // ── Patch XHR ──────────────────────────────────────────────────────────────
+  const OrigOpen = XMLHttpRequest.prototype.open;
+  const OrigSend = XMLHttpRequest.prototype.send;
 
-  XMLHttpRequest.prototype.open = function(method, url) {
-    this._lsUrl = url;
-    return origOpen.apply(this, arguments);
+  XMLHttpRequest.prototype.open = function (method: string, url: string) {
+    (this as XMLHttpRequest & { _lsUrl: string })._lsUrl = url;
+    return OrigOpen.apply(this, arguments as unknown as [string, string | URL]);
   };
 
-  XMLHttpRequest.prototype.send = function() {
-    var xhr = this;
-    xhr.addEventListener('load', function() {
+  XMLHttpRequest.prototype.send = function () {
+    const xhr = this as XMLHttpRequest & { _lsUrl: string };
+    xhr.addEventListener('load', function () {
       if (xhr.status < 200 || xhr.status >= 300) return;
-      var ct = xhr.getResponseHeader ? xhr.getResponseHeader('Content-Type') || '' : '';
-      var isJson = ct.indexOf('json') !== -1 || (xhr._lsUrl && xhr._lsUrl.indexOf('.json') !== -1);
-      if (!isJson) {
-        var text = xhr.responseText || '';
-        var t = text.trimStart();
-        if (t[0] !== '{' && t[0] !== '[') return;
-      }
-      var data = safeParse(xhr.responseText);
-      if (data) handleResponse(xhr._lsUrl || '', data);
+      const data = safeParse(xhr.responseText);
+      if (data) handleData(xhr._lsUrl ?? '', data);
     });
-    return origSend.apply(this, arguments);
+    return OrigSend.apply(this, arguments as unknown as [Document | XMLHttpRequestBodyInit | null | undefined]);
   };
 
-  console.log('[LeadSync] API interceptor ready');
-})();
-`;
-
-export function injectInterceptor(): void {
-  if (document.querySelector('[data-leadsync-injected]')) return;
-  const script = document.createElement('script');
-  script.setAttribute('data-leadsync-injected', 'true');
-  script.textContent = INJECTOR_CODE;
-  (document.head ?? document.documentElement).appendChild(script);
-  script.remove();
+  console.log('[LeadSync] Interceptor active on', window.location.href);
 }
 
 /**
- * Trigger IndiaMART to re-issue its lead list API call.
- * Clicks the "All" contacts tab which forces a data refresh.
+ * triggerLeadRefresh — called from the content script to make IndiaMART
+ * re-issue its lead list API call (so our interceptor captures fresh data).
  */
 export function triggerLeadRefresh(): void {
-  // Click "All" tab to reload current page's leads
-  const allTab = Array.from(document.querySelectorAll<HTMLElement>('a, button, li span, div'))
-    .find((el) => {
-      const txt = (el.textContent ?? '').trim();
-      return /^all$/i.test(txt) || /^all contacts$/i.test(txt);
-    });
+  const allTab = Array.from(document.querySelectorAll<HTMLElement>('a,button,span,li'))
+    .find((el) => /^all$/i.test((el.textContent ?? '').trim()));
+  if (allTab) { allTab.click(); return; }
 
-  if (allTab) {
-    allTab.click();
-    return;
-  }
-
-  // Fallback: click any active filter tab to re-trigger the current query
-  const activeTab = document.querySelector<HTMLElement>('.active a, a.active, .selected a, li.active');
-  if (activeTab) activeTab.click();
+  const active = document.querySelector<HTMLElement>('.active a, a.active, li.active a');
+  if (active) active.click();
 }

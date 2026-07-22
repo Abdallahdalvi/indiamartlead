@@ -14,6 +14,7 @@ import { signIn, signOut, getAuthState, ensureToken } from './auth';
 import { listSpreadsheets, listWorksheets } from './sheets';
 import { syncLead, syncAllLeads } from './sync';
 import { invalidateDedupIndex } from './dedup';
+import { leadsyncInterceptorMain } from '@/content/pageInjector';
 import {
   getConfig,
   setConfig,
@@ -131,21 +132,39 @@ async function handleMessage(msg: Message): Promise<MessageResponse> {
       return { success: true };
     }
 
+    // ── Inject interceptor into page MAIN world (CSP-safe) ───────────────────
+    case 'INJECT_INTERCEPTOR': {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      const tabId = tabs[0]?.id;
+      if (!tabId) return { success: false, error: 'No active tab.' };
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          world:  'MAIN',
+          func:   leadsyncInterceptorMain,
+        });
+        console.log('[LeadSync] Interceptor injected into tab', tabId);
+        return { success: true };
+      } catch (e) {
+        console.error('[LeadSync] executeScript failed:', e);
+        return { success: false, error: String(e) };
+      }
+    }
+
     // ── Lead Events (from content script) ────────────────────────────────────
     case 'LEAD_EXTRACTED': {
-      const { lead } = msg.payload as { lead: Lead };
+      const lead = msg.payload as Lead;
       await setCurrentLead(lead);
-      // Broadcast to any open extension pages (side panel, popup)
       broadcastToExtensionPages({ type: 'LEAD_EXTRACTED', payload: lead });
       return { success: true, data: lead };
     }
 
     case 'AUTO_SYNC_TRIGGERED': {
-      const { lead, autoSync } = msg.payload as { lead: Lead; autoSync: boolean };
+      const lead = msg.payload as Lead;
       await setCurrentLead(lead);
       broadcastToExtensionPages({ type: 'LEAD_EXTRACTED', payload: lead });
-
-      if (autoSync) {
+      const config = await getConfig();
+      if (config.autoSync) {
         const result = await syncLead(lead);
         return { success: true, data: result };
       }
@@ -154,7 +173,6 @@ async function handleMessage(msg: Message): Promise<MessageResponse> {
 
     // ── Content script extract ────────────────────────────────────────────────
     case 'EXTRACT_LEAD': {
-      // Forwarded from popup → active tab's content script
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (!tab?.id) return { success: false, error: 'No active tab.' };
       const response = await chrome.tabs.sendMessage(tab.id, { type: 'EXTRACT_LEAD' }) as MessageResponse;

@@ -134,6 +134,7 @@ export type MessageType =
   | 'SYNC_ALL_LEADS'
   | 'SYNC_ALL_PAGES'          // NEW: bulk sync all pages (530 leads)
   | 'BULK_SYNC_PROGRESS'      // NEW: progress update from content → popup
+  | 'INJECT_INTERCEPTOR'      // NEW: content → background → executeScript(MAIN world)
   | 'GET_IMPORT_LOG'
   | 'CLEAR_IMPORT_LOG'
   | 'GET_SYNC_STATS'
