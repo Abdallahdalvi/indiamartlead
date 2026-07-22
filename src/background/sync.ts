@@ -2,18 +2,13 @@
  * Sync orchestrator.
  *
  * syncLead()     → sync a single lead to Google Sheets.
- * syncAllLeads() → sync an array of leads sequentially with a small
- *                  inter-row delay to respect API rate limits.
+ * syncAllLeads() → sync an array of leads sequentially.
  *
- * Flow for each lead:
- *   1. Obtain a valid OAuth token.
- *   2. Load the user's selected spreadsheet / sheet from config.
- *   3. Compute the SHA-256 Lead ID.
- *   4. Build (or reuse) the in-memory dedup index (reads column A once).
- *   5. If duplicate → skip and log.
- *   6. If new → ensureHeaders → appendRow (INSERT_ROWS, never overwrites).
- *   7. Add the new hash to the in-memory index.
- *   8. Log the result and update cumulative stats.
+ * Sheet row layout (matches IndiaMART Lead Manager columns):
+ *   A: Lead ID  | B: Sender Name | C: Phone     | D: Product  |
+ *   E: Quantity | F: Message     | G: Location  | H: Source   |
+ *   I: Date&Time| J: Labels      | K: Company   | L: Email    |
+ *   M: State    | N: Budget      | O: Source URL| P: Imported At
  */
 
 import { ensureToken } from './auth';
@@ -25,12 +20,7 @@ import type { Lead, SyncResult } from '@/types';
 
 // ─── Single Lead ──────────────────────────────────────────────────────────────
 
-/**
- * Sync one lead.
- * Always returns a SyncResult — never throws (errors are caught and logged).
- */
 export async function syncLead(lead: Lead): Promise<SyncResult> {
-  // Declared outside try so catch block can log with it
   let sheetName: string | undefined;
 
   try {
@@ -44,7 +34,6 @@ export async function syncLead(lead: Lead): Promise<SyncResult> {
       };
     }
 
-    // Both are non-null after the guard — extract as narrowed strings
     const spreadsheetId = config.spreadsheetId;
     const sheetNameStr  = config.sheetName;
     sheetName = sheetNameStr;
@@ -52,7 +41,7 @@ export async function syncLead(lead: Lead): Promise<SyncResult> {
     // ── 1. Compute SHA-256 Lead ID ───────────────────────────────────────────
     const leadId = await getLeadId(lead);
 
-    // ── 2. Build / reuse dedup index (reads column A once per session) ───────
+    // ── 2. Build / reuse dedup index ──────────────────────────────────────────
     await buildDedupIndex(token, spreadsheetId, sheetNameStr);
 
     // ── 3. Duplicate check ───────────────────────────────────────────────────
@@ -70,32 +59,34 @@ export async function syncLead(lead: Lead): Promise<SyncResult> {
     // ── 4. Ensure headers exist (idempotent) ─────────────────────────────────
     await ensureHeaders(token, spreadsheetId, sheetNameStr);
 
-    // ── 5. Build row — column order must match SHEET_HEADERS exactly ─────────
+    // ── 5. Build row — MUST match SHEET_HEADERS order exactly ────────────────
     const importedAt = new Date().toISOString();
     const rowData: (string | null)[] = [
-      leadId,             // A: Lead ID  (SHA-256)
-      lead.buyerName,     // B: Buyer Name
-      lead.company,       // C: Company
-      lead.mobile,        // D: Mobile
-      lead.email,         // E: Email
-      lead.product,       // F: Product
-      lead.quantity,      // G: Quantity
-      lead.budget,        // H: Budget
-      lead.requirement,   // I: Requirement
-      lead.city,          // J: City
-      lead.state,         // K: State
-      lead.leadDate,      // L: Lead Date
-      lead.sourceUrl,     // M: Source URL
-      importedAt,         // N: Imported At
+      leadId,                // A: Lead ID  (SHA-256)
+      lead.buyerName,        // B: Sender Name
+      lead.mobile,           // C: Phone
+      lead.product,          // D: Product / Requirement
+      lead.quantity,         // E: Quantity
+      lead.requirement,      // F: Message preview
+      lead.city,             // G: Location
+      lead.source ?? null,   // H: Source (Buylead/Direct/Other)
+      lead.leadDate,         // I: Date & Time
+      lead.labels ?? null,   // J: Labels
+      lead.company,          // K: Company
+      lead.email,            // L: Email
+      lead.state,            // M: State
+      lead.budget,           // N: Budget
+      lead.sourceUrl,        // O: Source URL
+      importedAt,            // P: Imported At
     ];
 
     // ── 6. Append (INSERT_ROWS — never overwrites existing data) ─────────────
     const rowNumber = await appendRow(token, spreadsheetId, sheetNameStr, rowData);
 
-    // ── 7. Update in-memory index so subsequent leads in same session skip ───
+    // ── 7. Update in-memory index ─────────────────────────────────────────────
     addToIndex(leadId);
 
-    // ── 8. Log & stats ───────────────────────────────────────────────────────
+    // ── 8. Log & stats ────────────────────────────────────────────────────────
     await incrementStat('imported');
     const result: SyncResult = {
       status:    'imported',
@@ -123,17 +114,20 @@ export async function syncLead(lead: Lead): Promise<SyncResult> {
  * A small delay between rows avoids bursting the Sheets API quota.
  *
  * @param leads         - Array of leads to process
- * @param delayBetween  - Milliseconds to wait between rows (default 150ms)
+ * @param delayBetween  - Milliseconds to wait between rows (default 200ms)
+ * @param onProgress    - Optional callback called after each lead
  */
 export async function syncAllLeads(
   leads:         Lead[],
-  delayBetween   = 150,
+  delayBetween   = 200,
+  onProgress?:   (result: SyncResult, index: number) => void,
 ): Promise<SyncResult[]> {
   const results: SyncResult[] = [];
 
-  for (const lead of leads) {
-    const result = await syncLead(lead);
+  for (let i = 0; i < leads.length; i++) {
+    const result = await syncLead(leads[i]);
     results.push(result);
+    onProgress?.(result, i);
 
     if (delayBetween > 0) {
       await new Promise<void>((r) => setTimeout(r, delayBetween));

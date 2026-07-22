@@ -4,42 +4,49 @@
  */
 
 // ─── Sheet Column Layout ──────────────────────────────────────────────────────
-// Column A stores the SHA-256 Lead ID for O(1) deduplication.
-// Columns B–N store the actual lead data.
+// Columns match IndiaMART Lead Manager's exact structure.
+// Column A = SHA-256 Lead ID for O(1) deduplication (can be hidden).
 
 export const SHEET_COLUMNS = {
-  LEAD_ID:     'A',  // SHA-256 hash (hidden / narrow column)
-  BUYER_NAME:  'B',
-  COMPANY:     'C',
-  MOBILE:      'D',
-  EMAIL:       'E',
-  PRODUCT:     'F',
-  QUANTITY:    'G',
-  BUDGET:      'H',
-  REQUIREMENT: 'I',
-  CITY:        'J',
-  STATE:       'K',
-  LEAD_DATE:   'L',
-  SOURCE_URL:  'M',
-  IMPORTED_AT: 'N',
+  LEAD_ID:     'A',   // SHA-256 hash (hidden / narrow — dedup key)
+  BUYER_NAME:  'B',   // SENDER name
+  MOBILE:      'C',   // Phone number
+  PRODUCT:     'D',   // REQUIREMENT / product name
+  QUANTITY:    'E',   // Quantity
+  REQUIREMENT: 'F',   // MESSAGE preview
+  CITY:        'G',   // LOCATION
+  SOURCE:      'H',   // SOURCE (Buylead / Direct / Other / Catalog Link)
+  LEAD_DATE:   'I',   // DATE/TIME
+  LABELS:      'J',   // LABELS (comma-separated)
+  COMPANY:     'K',   // Company (from detail pages, may be blank)
+  EMAIL:       'L',   // Email (from detail pages, may be blank)
+  STATE:       'M',   // State
+  BUDGET:      'N',   // Budget (from detail pages, may be blank)
+  SOURCE_URL:  'O',   // Page URL
+  IMPORTED_AT: 'P',   // ISO timestamp when we imported
 } as const;
 
-/** Header row written to the sheet on first use. */
+/**
+ * Header row written to the sheet on first use.
+ * Matches IndiaMART Lead Manager columns exactly.
+ */
 export const SHEET_HEADERS: string[] = [
-  'Lead ID',
-  'Buyer Name',
-  'Company',
-  'Mobile',
-  'Email',
-  'Product',
-  'Quantity',
-  'Budget',
-  'Requirement',
-  'City',
-  'State',
-  'Lead Date',
-  'Source URL',
-  'Imported At',
+  'Lead ID',         // A — hidden dedup key
+  'Sender Name',     // B ← SENDER
+  'Phone',           // C
+  'Product/Req.',    // D ← REQUIREMENT
+  'Quantity',        // E
+  'Message',         // F ← MESSAGES preview
+  'Location',        // G ← LOCATION
+  'Source',          // H ← SOURCE (Buylead/Direct/Other)
+  'Date & Time',     // I ← DATE/TIME
+  'Labels',          // J ← LABELS
+  'Company',         // K
+  'Email',           // L
+  'State',           // M
+  'Budget',          // N
+  'Source URL',      // O
+  'Imported At',     // P
 ];
 
 // ─── Google API Endpoints ─────────────────────────────────────────────────────
@@ -67,6 +74,7 @@ export const STORAGE_KEYS = {
   IMPORT_LOG:    'leadsync_import_log',
   CURRENT_LEAD:  'leadsync_current_lead',
   SYNC_STATS:    'leadsync_sync_stats',
+  BULK_PROGRESS: 'leadsync_bulk_progress',
 } as const;
 
 /** Maximum number of log entries kept in storage (rolling window). */
@@ -75,6 +83,7 @@ export const MAX_LOG_ENTRIES = 500;
 // ─── IndiaMART URL Patterns ───────────────────────────────────────────────────
 
 export const INDIAMART_LEAD_PATTERNS = [
+  /seller\.indiamart\.com\/messagecentre/i,  // Lead Manager (primary target)
   /indiamart\.com\/messagebox/i,
   /indiamart\.com\/buy-lead/i,
   /indiamart\.com\/buyer-central/i,
@@ -85,3 +94,7 @@ export const INDIAMART_LEAD_PATTERNS = [
   /seller\.indiamart\.com/i,
   /my\.indiamart\.com/i,
 ];
+
+/** True if the current page is the Lead Manager list page. */
+export const IS_LEAD_MANAGER =
+  /seller\.indiamart\.com\/messagecentre/i.test(window?.location?.href ?? '');

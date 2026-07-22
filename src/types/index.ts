@@ -9,22 +9,28 @@
 export interface Lead {
   /** SHA-256 hash used as the unique Lead ID (set by background after hashing). */
   leadId?: string;
-  buyerName:   string | null;
-  company:     string | null;
-  mobile:      string | null;
-  email:       string | null;
-  product:     string | null;
-  quantity:    string | null;
-  budget:      string | null;
-  requirement: string | null;
-  city:        string | null;
-  state:       string | null;
-  leadDate:    string | null;
+
+  // ── IndiaMART Lead Manager columns ──────────────────────────────────────
+  buyerName:   string | null;   // SENDER name
+  company:     string | null;   // Company (buyer detail pages)
+  mobile:      string | null;   // Phone number
+  email:       string | null;   // Email
+  product:     string | null;   // REQUIREMENT / product name
+  quantity:    string | null;   // Quantity from requirement column
+  requirement: string | null;   // MESSAGE preview text
+  budget:      string | null;   // Budget (buyer detail pages)
+  city:        string | null;   // LOCATION
+  state:       string | null;   // State
+  source:      string | null;   // SOURCE (Buylead / Direct / Other / Catalog Link)
+  leadDate:    string | null;   // DATE/TIME column
+  labels:      string | null;   // LABELS column (comma-separated)
+
+  // ── Meta ──────────────────────────────────────────────────────────────────
   sourceUrl:   string;
   importedAt?: string;
 }
 
-/** Mutable version used in the side-panel form (no computed / readonly fields). */
+/** Mutable version used in the side-panel form. */
 export type EditableLead = Omit<Lead, 'leadId' | 'importedAt'>;
 
 /** Result of a single lead sync attempt. */
@@ -41,6 +47,19 @@ export interface SyncStats {
   duplicates:  number;
   errors:      number;
   lastSyncAt?: string;
+}
+
+// ─── Bulk sync progress ───────────────────────────────────────────────────────
+
+/** Progress update sent during a bulk 530-lead sync. */
+export interface BulkSyncProgress {
+  total:      number;
+  current:    number;
+  imported:   number;
+  duplicates: number;
+  errors:     number;
+  page:       number;
+  done:       boolean;
 }
 
 // ─── Import Log ───────────────────────────────────────────────────────────────
@@ -113,14 +132,16 @@ export type MessageType =
   | 'GET_WORKSHEETS'
   | 'SYNC_LEAD'
   | 'SYNC_ALL_LEADS'
+  | 'SYNC_ALL_PAGES'          // NEW: bulk sync all pages (530 leads)
+  | 'BULK_SYNC_PROGRESS'      // NEW: progress update from content → popup
   | 'GET_IMPORT_LOG'
   | 'CLEAR_IMPORT_LOG'
   | 'GET_SYNC_STATS'
   | 'RESET_SYNC_STATS'
   | 'OPEN_SIDE_PANEL'
-  | 'EXTRACT_LEAD'             // Popup → Content: extract current page
-  | 'LEAD_EXTRACTED'           // Content/Background → All: new lead available
-  | 'AUTO_SYNC_TRIGGERED';     // Content → Background: auto-sync a detected lead
+  | 'EXTRACT_LEAD'
+  | 'LEAD_EXTRACTED'
+  | 'AUTO_SYNC_TRIGGERED';
 
 export interface Message<T = unknown> {
   type:     MessageType;
