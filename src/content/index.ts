@@ -58,24 +58,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   // 2. Background asks to click Next Page button
   if (type === 'CLICK_NEXT_PAGE') {
-    (async () => {
-      try {
-        const sig = getPageSignature();
-        const nextBtn = findNextButton();
-        if (!nextBtn) {
-          sendResponse({ success: true, data: { hasNext: false } });
-          return;
-        }
-
-        nextBtn.click();
-
-        // Short wait for DOM change (up to 5s)
-        const changed = await waitForPageChange(sig, 5_000);
-        sendResponse({ success: true, data: { hasNext: true, changed } });
-      } catch (e) {
-        sendResponse({ success: false, error: String(e) });
-      }
-    })();
+    const nextBtn = findNextButton();
+    if (!nextBtn) {
+      sendResponse({ success: true, data: { hasNext: false } });
+    } else {
+      nextBtn.click();
+      sendResponse({ success: true, data: { hasNext: true } });
+    }
     return true;
   }
 

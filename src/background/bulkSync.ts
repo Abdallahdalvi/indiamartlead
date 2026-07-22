@@ -134,8 +134,29 @@ export async function startBackgroundBulkSync(): Promise<void> {
         break;
       }
 
-      // Step D: Wait 1.5s in background Service Worker (never throttled by Chrome tab state!)
-      await new Promise<void>((r) => setTimeout(r, 1_500));
+      // Step D: Wait in background Service Worker (never throttled by Chrome tab state!)
+      // Poll until the first lead on the page changes, indicating the new page loaded.
+      let pageChanged = false;
+      for (let w = 0; w < 10; w++) {
+        if (cancelRequested) break;
+        await new Promise<void>((r) => setTimeout(r, 1000));
+        try {
+          const checkResp = (await chrome.tabs.sendMessage(tabId, { type: 'EXTRACT_PAGE_LEADS' })) as MessageResponse<Lead[]>;
+          const newLeads = checkResp?.data ?? [];
+          if (newLeads.length > 0 && newLeads[0].mobile !== pageLeads[0]?.mobile) {
+            pageChanged = true;
+            break;
+          }
+        } catch {
+          // Tab might be refreshing
+        }
+      }
+
+      if (!pageChanged) {
+        console.log('[LeadSync Background] Page did not change after 10s. Stopping.');
+        break;
+      }
+
       page++;
 
       if (page > 60) break; // Safety cap

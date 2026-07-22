@@ -32,108 +32,73 @@ function extractPhone(text: string): string | null {
 
 // ─── Extract Lead from Row ────────────────────────────────────────────────────
 
-function extractLeadFromRow(row: Element): Lead | null {
-  let cells = Array.from(row.querySelectorAll('td'));
-  if (cells.length === 0) {
-    cells = Array.from(row.children).filter((c) => {
-      const tag = c.tagName.toUpperCase();
-      return tag !== 'SCRIPT' && tag !== 'STYLE' && tag !== 'INPUT';
-    }) as HTMLTableCellElement[];
+function extractLeadFromRow(row: Element, mobile: string): Lead | null {
+  const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT, null);
+  let node;
+  const texts: string[] = [];
+  while ((node = walker.nextNode())) {
+    const t = (node.nodeValue || '').trim();
+    if (t) texts.push(t);
   }
 
-  if (cells.length < 2) return null;
-
-  // 1. Locate Sender Cell & Phone Number
   let senderIdx = -1;
-  let mobile: string | null = null;
-
-  for (let i = 0; i < cells.length; i++) {
-    const text = cells[i].textContent ?? '';
-    const phone = extractPhone(text);
-    if (phone) {
-      senderIdx = i;
-      mobile = phone;
-      break;
-    }
+  let phoneStr = '';
+  for (let i = 0; i < texts.length; i++) {
+     const p = extractPhone(texts[i]);
+     if (p === mobile) { senderIdx = i; phoneStr = texts[i]; break; }
   }
 
-  if (senderIdx === -1 || !mobile) return null;
+  if (senderIdx === -1) return null;
 
-  // Sender Name (Text from Sender Cell minus Phone number & UI noise)
-  const senderText = cells[senderIdx].textContent ?? '';
-  const buyerName = clean(
-    senderText
-      .replace(PHONE_GLOBAL_RE, '')
-      .replace(/GST/gi, '')
-      .replace(/Verified/gi, '')
-      .replace(/Add note|\+/gi, '')
-      .trim()
-      .split('\n')[0]
-  ) || 'IndiaMART Lead';
+  let buyerName = 'IndiaMART Lead';
+  for (let i = senderIdx - 1; i >= 0; i--) {
+     const t = texts[i];
+     if (!NOISE_RE.test(t) && !/GST|Verified|Premium|\+ Label/i.test(t) && t.length > 2) {
+         buyerName = clean(t) || buyerName;
+         break;
+     }
+  }
 
-  // 2. Requirement / Product Name (Cell immediately after Sender Cell)
+  if (buyerName === 'IndiaMART Lead' && texts[senderIdx].length > phoneStr.length + 3) {
+     const parts = texts[senderIdx].split(phoneStr);
+     if (parts[0].trim().length > 2 && !/GST|Verified/.test(parts[0])) {
+         buyerName = clean(parts[0]) || buyerName;
+     }
+  }
+
+  let requirement: string | null = null;
+  let city: string | null = null;
+  let source: string | null = null;
+  let leadDate: string | null = null;
+  let labels: string | null = null;
   let product: string | null = null;
-  if (senderIdx + 1 < cells.length) {
-    const reqText = (cells[senderIdx + 1].textContent ?? '').trim();
-    if (reqText && reqText !== '-' && !reqText.startsWith('+ Label')) {
-      product = clean(reqText);
-    }
-  }
 
-  // 3. Classify all remaining cells in the row by content
-  let requirement: string | null = null; // Message preview column
-  let city: string | null = null;        // Location / City column
-  let source: string | null = null;      // Lead Source column
-  let leadDate: string | null = null;    // Date / Time column
-  let labels: string | null = null;      // Labels column
+  for (let i = senderIdx + 1; i < texts.length; i++) {
+     const txt = texts[i];
+     if (NOISE_RE.test(txt)) continue;
 
-  for (let i = senderIdx + 2; i < cells.length; i++) {
-    const cell = cells[i];
-    const txt = (cell.textContent ?? '').trim();
-    if (!txt || NOISE_RE.test(txt)) continue;
-
-    // Check for Labels badge inside cell first
-    const badgeEls = cell.querySelectorAll('[class*="badge"], [class*="label"], [class*="tag"]');
-    if (badgeEls.length > 0) {
-      const badgeTexts = Array.from(badgeEls)
-        .map((b) => b.textContent?.trim())
-        .filter((t) => t && t !== '+ Label' && t !== 'Add note');
-      if (badgeTexts.length > 0) {
-        labels = labels ?? clean(badgeTexts.join(', '));
+     if (!source && SOURCE_RE.test(txt)) {
+       source = txt.match(SOURCE_RE)![0];
+       continue;
+     }
+     if (!leadDate && DATE_RE.test(txt) && !txt.includes('Tomorrow')) {
+       leadDate = txt.match(DATE_RE)![0];
+       continue;
+     }
+     if (!city && txt.length >= 3 && txt.length <= 35 && /^[A-Za-z\s,]+$/.test(txt)) {
+       if (!/^(Tomorrow|Add note|Buylead|Direct|Other|Call|Catalog Link|Catalogue Link|Rating submitted)$/i.test(txt)) {
+         city = clean(txt);
+         continue;
+       }
+     }
+     if (!product && txt.length > 4 && !txt.startsWith('+') && !txt.includes('Label')) {
+        product = clean(txt);
         continue;
-      }
-    }
-
-    // Check Source (e.g. Buylead, Other, Call)
-    if (!source) {
-      const srcMatch = txt.match(SOURCE_RE);
-      if (srcMatch) {
-        source = srcMatch[0];
+     }
+     if (product && !requirement && txt.length > 5) {
+        requirement = clean(txt);
         continue;
-      }
-    }
-
-    // Check Date / Time (e.g. 10:50 AM, 10:45 AM, Yesterday, 18 Jul)
-    if (!leadDate && !txt.includes('Tomorrow')) {
-      const dateMatch = txt.match(DATE_RE);
-      if (dateMatch) {
-        leadDate = dateMatch[0];
-        continue;
-      }
-    }
-
-    // Check Location / City (Short string 2-35 chars, letters/spaces only, not noise)
-    if (!city && txt.length >= 2 && txt.length <= 35 && /^[A-Za-z\s]+$/.test(txt)) {
-      if (!/^(Tomorrow|Add note|Buylead|Direct|Other|Call|Catalog Link|Catalogue Link|Rating submitted)$/i.test(txt)) {
-        city = clean(txt);
-        continue;
-      }
-    }
-
-    // Check Message Preview / Requirement Details (Length > 6, not noise)
-    if (!requirement && txt.length >= 6 && !txt.startsWith('+ Label')) {
-      requirement = clean(txt);
-    }
+     }
   }
 
   const anchor = row.querySelector<HTMLAnchorElement>('a[href*="messagecentre"], a[href*="lead"], a[href*="contact"]');
@@ -159,23 +124,48 @@ function extractLeadFromRow(row: Element): Lead | null {
 // ─── Public DOM Extractor ─────────────────────────────────────────────────────
 
 export function extractLeadManagerPage(): Lead[] {
-  const trs = Array.from(document.querySelectorAll('tr')).filter((tr) => {
-    if (tr.querySelector('th')) return false;
-    const text = tr.textContent ?? '';
-    return PHONE_RE.test(text);
-  });
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+  let node;
+  const phoneNodes: Node[] = [];
+  while ((node = walker.nextNode())) {
+    if (PHONE_RE.test(node.nodeValue || '')) {
+      phoneNodes.push(node);
+    }
+  }
 
   const leads: Lead[] = [];
   const seenPhones = new Set<string>();
 
-  for (const tr of trs) {
+  for (const pNode of phoneNodes) {
+    let el = pNode.parentElement;
+    let rowEl: HTMLElement | null = null;
+    let fallbackEl: HTMLElement | null = null;
+
+    while (el && el !== document.body) {
+      const tag = el.tagName.toUpperCase();
+      const cls = typeof el.className === 'string' ? el.className.toLowerCase() : '';
+      if (tag === 'TR' || 
+          (tag === 'DIV' && /row|list-item|list_item|msg-item|lead-item/.test(cls)) ||
+          (tag === 'LI')) {
+        rowEl = el;
+        break;
+      }
+      if (!fallbackEl && (el.textContent || '').length > 50 && (el.textContent || '').length < 1000) {
+        fallbackEl = el;
+      }
+      el = el.parentElement;
+    }
+
+    const targetRow = rowEl || fallbackEl;
+    if (!targetRow) continue;
+
+    const phoneStr = extractPhone(pNode.nodeValue || '');
+    if (!phoneStr || seenPhones.has(phoneStr)) continue;
+
     try {
-      const lead = extractLeadFromRow(tr);
+      const lead = extractLeadFromRow(targetRow, phoneStr);
       if (!lead || !lead.mobile) continue;
-
-      if (seenPhones.has(lead.mobile)) continue;
       seenPhones.add(lead.mobile);
-
       leads.push(lead);
     } catch (e) {
       console.warn('[LeadSync] Error parsing row:', e);
