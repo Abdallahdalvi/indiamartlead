@@ -132,9 +132,13 @@ export type MessageType =
   | 'GET_WORKSHEETS'
   | 'SYNC_LEAD'
   | 'SYNC_ALL_LEADS'
-  | 'SYNC_ALL_PAGES'          // NEW: bulk sync all pages (530 leads)
-  | 'BULK_SYNC_PROGRESS'      // NEW: progress update from content → popup
-  | 'INJECT_INTERCEPTOR'      // NEW: content → background → executeScript(MAIN world)
+  | 'SYNC_ALL_PAGES'          // Bulk sync all pages
+  | 'START_BULK_SYNC'         // Popup → Background: start background-driven bulk sync
+  | 'CANCEL_BULK_SYNC'        // Popup → Background: stop background bulk sync
+  | 'EXTRACT_PAGE_LEADS'      // Background → Content: extract current page DOM leads
+  | 'CLICK_NEXT_PAGE'         // Background → Content: click next page button
+  | 'BULK_SYNC_PROGRESS'      // Progress update
+  | 'INJECT_INTERCEPTOR'
   | 'GET_IMPORT_LOG'
   | 'CLEAR_IMPORT_LOG'
   | 'GET_SYNC_STATS'

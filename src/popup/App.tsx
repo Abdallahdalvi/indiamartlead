@@ -159,11 +159,9 @@ export default function App() {
 
   // ── Bulk sync all 530 leads ───────────────────────────────────────────────
   const handleBulkSync = useCallback(async () => {
-    const tabId = activeTabIdRef.current;
-    if (!tabId) return;
     setBulkRunning(true);
     setBulkProgress({ total: 530, current: 0, imported: 0, duplicates: 0, errors: 0, page: 1, done: false });
-    await chrome.tabs.sendMessage(tabId, { type: 'SYNC_ALL_PAGES' });
+    await chrome.runtime.sendMessage({ type: 'START_BULK_SYNC' });
   }, []);
 
   const isConfigured  = !!(config?.spreadsheetId && config?.sheetName);

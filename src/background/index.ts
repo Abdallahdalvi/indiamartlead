@@ -13,6 +13,7 @@
 import { signIn, signOut, getAuthState, ensureToken } from './auth';
 import { listSpreadsheets, listWorksheets } from './sheets';
 import { syncLead, syncAllLeads } from './sync';
+import { startBackgroundBulkSync, cancelBulkSync } from './bulkSync';
 import { invalidateDedupIndex } from './dedup';
 import {
   getConfig,
@@ -96,6 +97,18 @@ async function handleMessage(msg: Message): Promise<MessageResponse> {
       const leads   = msg.payload as Lead[];
       const results = await syncAllLeads(leads);
       return { success: true, data: results };
+    }
+
+    // Background-driven 530-lead bulk sync (immune to tab switching)
+    case 'START_BULK_SYNC': {
+      startBackgroundBulkSync().catch((err) => {
+        console.error('[LeadSync] Background bulk sync error:', err);
+      });
+      return { success: true, data: { started: true } };
+    }
+    case 'CANCEL_BULK_SYNC': {
+      cancelBulkSync();
+      return { success: true };
     }
 
     // ── Import Log ────────────────────────────────────────────────────────────
