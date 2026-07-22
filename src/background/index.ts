@@ -14,7 +14,6 @@ import { signIn, signOut, getAuthState, ensureToken } from './auth';
 import { listSpreadsheets, listWorksheets } from './sheets';
 import { syncLead, syncAllLeads } from './sync';
 import { invalidateDedupIndex } from './dedup';
-import { leadsyncInterceptorMain } from '@/content/pageInjector';
 import {
   getConfig,
   setConfig,
@@ -132,24 +131,6 @@ async function handleMessage(msg: Message): Promise<MessageResponse> {
       return { success: true };
     }
 
-    // ── Inject interceptor into page MAIN world (CSP-safe) ───────────────────
-    case 'INJECT_INTERCEPTOR': {
-      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-      const tabId = tabs[0]?.id;
-      if (!tabId) return { success: false, error: 'No active tab.' };
-      try {
-        await chrome.scripting.executeScript({
-          target: { tabId },
-          world:  'MAIN',
-          func:   leadsyncInterceptorMain,
-        });
-        console.log('[LeadSync] Interceptor injected into tab', tabId);
-        return { success: true };
-      } catch (e) {
-        console.error('[LeadSync] executeScript failed:', e);
-        return { success: false, error: String(e) };
-      }
-    }
 
     // ── Lead Events (from content script) ────────────────────────────────────
     case 'LEAD_EXTRACTED': {

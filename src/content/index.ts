@@ -1,50 +1,25 @@
 /**
- * Content script entry point (IIFE bundle).
+ * Content script entry point.
  *
- * On seller.indiamart.com/messagecentre (Lead Manager):
- *   1. Ask background to inject the XHR/fetch interceptor via
- *      chrome.scripting.executeScript({ world: 'MAIN' }) — CSP-safe.
- *   2. Listen for captured API lead data via window.postMessage.
- *   3. On SYNC_ALL_PAGES: sync leads page by page with auto-pagination.
- *
- * On buyer detail / other IndiaMART pages:
- *   Single-lead extraction + optional auto-sync.
+ * Direct DOM-based extraction for seller.indiamart.com/messagecentre.
+ * No API key or network interceptor required.
  */
 
-import { triggerLeadRefresh } from './pageInjector';
 import {
   extractLeadManagerPage,
   findNextButton,
   waitForPageChange,
   getPageSignature,
-  setCapturedLeads,
-  getCapturedLeads,
-  clearCapturedLeads,
 } from './leadmanager';
 import { extractLead } from './extractor';
 import { observeNavigation } from './observer';
 import type { Lead, BulkSyncProgress } from '@/types';
 
-// ─── Inject interceptor via background (CSP-safe) ───────────────────────────
-// IndiaMART has a strict CSP that blocks inline <script> tags.
-// We ask the background worker to call chrome.scripting.executeScript
-// with world:'MAIN' which Chrome injects natively — bypasses CSP.
-
-async function injectViaBackground(): Promise<void> {
-  try {
-    await chrome.runtime.sendMessage({ type: 'INJECT_INTERCEPTOR' });
-    console.log('[LeadSync] Interceptor injection requested.');
-  } catch (e) {
-    console.warn('[LeadSync] Could not inject interceptor:', e);
-  }
-}
-
-
 function isLeadManager(): boolean {
   return /seller\.indiamart\.com\/messagecentre/i.test(window.location.href);
 }
 
-// ─── Send lead to background ──────────────────────────────────────────────────
+// ─── Send lead to background worker ──────────────────────────────────────────
 
 async function syncOneToBackground(lead: Lead): Promise<{ status: string } | null> {
   try {
@@ -55,63 +30,13 @@ async function syncOneToBackground(lead: Lead): Promise<{ status: string } | nul
   }
 }
 
-// ─── Listen for API captures from injected page script ───────────────────────
-// The injected script runs in the MAIN world and posts back here.
-
-let apiLeadsBuffer: Lead[] = [];
-let onApiLeadsCb: (() => void) | null = null;
-
-window.addEventListener('message', (event: MessageEvent) => {
-  if (event.source !== window) return;
-  if (event.data?.type !== 'LEADSYNC_API_LEADS') return;
-
-  const raw: Record<string, unknown>[] = event.data.leads ?? [];
-  if (!raw.length) return;
-
-  console.log(`[LeadSync] API captured ${raw.length} leads from ${event.data.url}`);
-
-  // The injector already parsed them into our Lead shape
-  const leads = raw as unknown as Lead[];
-  apiLeadsBuffer = leads;
-  setCapturedLeads(leads);
-
-  // Notify any waiting bulk-sync that new leads arrived
-  onApiLeadsCb?.();
-  onApiLeadsCb = null;
-});
-
-/** Wait up to `timeoutMs` for the API interceptor to deliver new leads. */
-function waitForApiCapture(timeoutMs = 10_000): Promise<Lead[]> {
-  return new Promise((resolve) => {
-    // If already populated, return immediately
-    if (apiLeadsBuffer.length > 0) {
-      const leads = [...apiLeadsBuffer];
-      apiLeadsBuffer = [];
-      resolve(leads);
-      return;
-    }
-    const timer = setTimeout(() => {
-      onApiLeadsCb = null;
-      resolve([]);
-    }, timeoutMs);
-    onApiLeadsCb = () => {
-      clearTimeout(timer);
-      const leads = [...apiLeadsBuffer];
-      apiLeadsBuffer = [];
-      resolve(leads);
-    };
-  });
-}
-
-// ─── Bulk sync: all pages ─────────────────────────────────────────────────────
+// ─── Bulk sync: all pages via DOM extraction ──────────────────────────────────
 
 let bulkSyncRunning = false;
 
 async function runBulkSync(): Promise<void> {
   if (bulkSyncRunning) return;
   bulkSyncRunning = true;
-  clearCapturedLeads();
-  apiLeadsBuffer = [];
 
   let page        = 1;
   let totalSynced = 0;
@@ -136,65 +61,52 @@ async function runBulkSync(): Promise<void> {
 
   try {
     while (true) {
-      // ── Get leads for this page ─────────────────────────────────────────
-      let pageLeads: Lead[] = [];
-
-      // Try API capture first (reliable)
-      // Trigger a refresh to force a new API call for the current page
-      triggerLeadRefresh();
-      const apiLeads = await waitForApiCapture(8_000);
-
-      if (apiLeads.length > 0) {
-        pageLeads = apiLeads;
-        console.log(`[LeadSync] Page ${page}: API gave ${pageLeads.length} leads`);
-      } else {
-        // Fallback: DOM phone-number walk
-        pageLeads = extractLeadManagerPage();
-        console.log(`[LeadSync] Page ${page}: DOM fallback gave ${pageLeads.length} leads`);
-      }
+      // 1. Extract leads directly from DOM on current page
+      const pageLeads = extractLeadManagerPage();
+      console.log(`[LeadSync] Page ${page}: extracted ${pageLeads.length} leads from DOM.`);
 
       if (pageLeads.length === 0) {
-        console.log('[LeadSync] No leads on this page, stopping.');
+        console.log('[LeadSync] No leads found on this page. Stopping.');
         break;
       }
 
-      // ── Sync each lead ─────────────────────────────────────────────────
+      // 2. Sync each lead to Google Sheets
       for (const lead of pageLeads) {
         const result = await syncOneToBackground(lead);
         const status = result?.status ?? 'error';
-        if (status === 'imported')  imported++;
+        if (status === 'imported')       imported++;
         else if (status === 'duplicate') duplicates++;
-        else errors++;
+        else                            errors++;
         totalSynced++;
 
-        // Rate limit: 150ms between rows
-        await new Promise<void>((r) => setTimeout(r, 150));
+        // Small rate limit delay between rows
+        await new Promise<void>((r) => setTimeout(r, 120));
       }
 
       sendProgress(false);
 
-      // ── Paginate ────────────────────────────────────────────────────────
+      // 3. Auto-paginate to next page
       const sig = getPageSignature();
       const nextBtn = findNextButton();
       if (!nextBtn) {
-        console.log('[LeadSync] No next page button, done.');
+        console.log('[LeadSync] Reached end (no Next button). Sync complete.');
         break;
       }
 
-      // Clear buffer before clicking next so we wait for new capture
-      apiLeadsBuffer = [];
-
+      console.log(`[LeadSync] Navigating to page ${page + 1}...`);
       nextBtn.click();
-      const changed = await waitForPageChange(sig, 10_000);
+
+      const changed = await waitForPageChange(sig, 8_000);
       if (!changed) {
-        console.log('[LeadSync] Page did not update after 10s, stopping.');
+        console.log('[LeadSync] Page did not update after 8s. Stopping.');
         break;
       }
 
-      // Wait a bit for the page's own API call to fire
-      await new Promise<void>((r) => setTimeout(r, 1_500));
+      // Short wait for DOM render
+      await new Promise<void>((r) => setTimeout(r, 1_000));
       page++;
-      if (page > 50) break; // safety cap
+
+      if (page > 60) break; // Safety limit
     }
   } finally {
     bulkSyncRunning = false;
@@ -219,7 +131,7 @@ async function runAutoSync(): Promise<void> {
     if (config?.data?.autoSync) {
       await chrome.runtime.sendMessage({ type: 'AUTO_SYNC_TRIGGERED', payload: lead });
     }
-  } catch { /* popup not open */ }
+  } catch { /* popup closed */ }
 }
 
 // ─── Message listener ─────────────────────────────────────────────────────────
@@ -252,7 +164,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       sendResponse({ success: true, data: { total: leads.length } });
       for (const lead of leads) {
         await syncOneToBackground(lead);
-        await new Promise<void>((r) => setTimeout(r, 150));
+        await new Promise<void>((r) => setTimeout(r, 120));
       }
     })();
     return true;
@@ -265,15 +177,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 function init(): void {
   if (isLeadManager()) {
-    // Ask background to inject interceptor into MAIN world (CSP-safe)
-    injectViaBackground().then(() => {
-      console.log('[LeadSync] Lead Manager ready.');
-      // Sanity check: how many rows does DOM see?
-      setTimeout(() => {
-        const domLeads = extractLeadManagerPage();
-        console.log(`[LeadSync] DOM sanity check: ${domLeads.length} leads on page 1.`);
-      }, 2_000);
-    });
+    console.log('[LeadSync] Lead Manager DOM Extractor active.');
+    setTimeout(() => {
+      const domLeads = extractLeadManagerPage();
+      console.log(`[LeadSync] Ready: ${domLeads.length} leads detected on page 1.`);
+    }, 1_500);
   } else {
     setTimeout(runAutoSync, 1_000);
   }
@@ -282,7 +190,6 @@ function init(): void {
 init();
 observeNavigation(() => {
   setTimeout(() => {
-    if (isLeadManager()) injectViaBackground();
-    else runAutoSync();
-  }, 1_200);
+    if (!isLeadManager()) runAutoSync();
+  }, 1_000);
 });
