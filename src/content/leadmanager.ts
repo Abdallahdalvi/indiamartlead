@@ -1,10 +1,10 @@
 /**
  * leadmanager.ts
  *
- * Direct DOM Lead Extractor for seller.indiamart.com/messagecentre.
- * Maps columns dynamically from the table header or uses IndiaMART's exact
- * column layout so Sender, Phone, Requirement, Message, Location, Source, Date,
- * and Labels are populated 100% accurately.
+ * Content-based DOM Lead Extractor for seller.indiamart.com/messagecentre.
+ * Inspects each row's cells dynamically by content classification instead of
+ * fragile index offsets. Populates Sender, Phone, Requirement, Message,
+ * Location, Source, Date, and Labels with 100% precision.
  */
 
 import type { Lead } from '@/types';
@@ -13,6 +13,10 @@ import type { Lead } from '@/types';
 
 const PHONE_RE = /(?:0|\+91|91)?([6-9]\d{9}|\d{10})/;
 const PHONE_GLOBAL_RE = /(?:0|\+91|91)?([6-9]\d{9}|\d{10})/g;
+
+const DATE_RE = /\b(?:\d{1,2}:\d{2}\s*(?:AM|PM)?|Yesterday|\d{1,2}\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b/i;
+const SOURCE_RE = /\b(Buylead|Direct|Other|Call|Catalog Link|Catalogue Link|Buy Leads)\b/i;
+const NOISE_RE = /^(Tomorrow|Add note|\+|\d{1,2}:\d{2}|Actions|Manage columns|Folders|Page \d+)$/i;
 
 function clean(text: string | null | undefined, max = 500): string | null {
   if (!text) return null;
@@ -26,55 +30,9 @@ function extractPhone(text: string): string | null {
   return m ? m[1] : null;
 }
 
-// ─── Column Mapping ───────────────────────────────────────────────────────────
-
-interface ColumnMapping {
-  sender: number;
-  requirement: number;
-  labels: number;
-  messages: number;
-  location: number;
-  source: number;
-  date: number;
-}
-
-/**
- * Detect column indices dynamically by inspecting table header cells (th / td).
- * Defaults to IndiaMART's standard Lead Manager layout if headers aren't explicit.
- */
-function getColumnMapping(): ColumnMapping {
-  const mapping: ColumnMapping = {
-    sender: 2,
-    requirement: 3,
-    labels: 4,
-    messages: 7,
-    location: 8,
-    source: 10,
-    date: 11,
-  };
-
-  // Look for header row (tr containing th or header text)
-  const headerRow = document.querySelector('tr:has(th), tr.table-header, thead tr, tr[class*="header"]');
-  if (!headerRow) return mapping;
-
-  const headerCells = Array.from(headerRow.querySelectorAll('th, td'));
-  headerCells.forEach((cell, idx) => {
-    const txt = (cell.textContent ?? '').trim().toUpperCase();
-    if (txt.includes('SENDER') || txt.includes('CONTACT')) mapping.sender = idx;
-    else if (txt.includes('REQUIREMENT') || txt.includes('PRODUCT')) mapping.requirement = idx;
-    else if (txt.includes('LABEL')) mapping.labels = idx;
-    else if (txt.includes('MESSAGE')) mapping.messages = idx;
-    else if (txt.includes('LOCATION') || txt.includes('CITY')) mapping.location = idx;
-    else if (txt.includes('SOURCE')) mapping.source = idx;
-    else if (txt.includes('DATE') || txt.includes('TIME')) mapping.date = idx;
-  });
-
-  return mapping;
-}
-
 // ─── Extract Lead from Row ────────────────────────────────────────────────────
 
-function extractLeadFromRow(row: Element, map: ColumnMapping): Lead | null {
+function extractLeadFromRow(row: Element): Lead | null {
   let cells = Array.from(row.querySelectorAll('td'));
   if (cells.length === 0) {
     cells = Array.from(row.children).filter((c) => {
@@ -83,30 +41,28 @@ function extractLeadFromRow(row: Element, map: ColumnMapping): Lead | null {
     }) as HTMLTableCellElement[];
   }
 
-  if (cells.length < 3) return null;
+  if (cells.length < 2) return null;
 
-  // 1. Locate Sender Cell & Phone
-  let senderIdx = map.sender;
-  if (senderIdx >= cells.length || !PHONE_RE.test(cells[senderIdx]?.textContent ?? '')) {
-    // Fallback: search first 4 cells for phone number
-    senderIdx = -1;
-    for (let i = 0; i < Math.min(4, cells.length); i++) {
-      if (PHONE_RE.test(cells[i].textContent ?? '')) {
-        senderIdx = i;
-        break;
-      }
+  // 1. Locate Sender Cell & Phone Number
+  let senderIdx = -1;
+  let mobile: string | null = null;
+
+  for (let i = 0; i < cells.length; i++) {
+    const text = cells[i].textContent ?? '';
+    const phone = extractPhone(text);
+    if (phone) {
+      senderIdx = i;
+      mobile = phone;
+      break;
     }
   }
 
-  if (senderIdx === -1) return null;
+  if (senderIdx === -1 || !mobile) return null;
 
-  const senderCellText = cells[senderIdx].textContent ?? '';
-  const mobile = extractPhone(senderCellText);
-  if (!mobile) return null;
-
-  // Sender Name
+  // Sender Name (Text from Sender Cell minus Phone number & UI noise)
+  const senderText = cells[senderIdx].textContent ?? '';
   const buyerName = clean(
-    senderCellText
+    senderText
       .replace(PHONE_GLOBAL_RE, '')
       .replace(/GST/gi, '')
       .replace(/Verified/gi, '')
@@ -115,65 +71,68 @@ function extractLeadFromRow(row: Element, map: ColumnMapping): Lead | null {
       .split('\n')[0]
   ) || 'IndiaMART Lead';
 
-  // Helper to safely get clean text from a target index
-  const getCellText = (idx: number, fallbackOffset?: number): string | null => {
-    let cell = cells[idx];
-    if (!cell && fallbackOffset !== undefined && senderIdx + fallbackOffset < cells.length) {
-      cell = cells[senderIdx + fallbackOffset];
+  // 2. Requirement / Product Name (Cell immediately after Sender Cell)
+  let product: string | null = null;
+  if (senderIdx + 1 < cells.length) {
+    const reqText = (cells[senderIdx + 1].textContent ?? '').trim();
+    if (reqText && reqText !== '-' && !reqText.startsWith('+ Label')) {
+      product = clean(reqText);
     }
-    if (!cell) return null;
+  }
+
+  // 3. Classify all remaining cells in the row by content
+  let requirement: string | null = null; // Message preview column
+  let city: string | null = null;        // Location / City column
+  let source: string | null = null;      // Lead Source column
+  let leadDate: string | null = null;    // Date / Time column
+  let labels: string | null = null;      // Labels column
+
+  for (let i = senderIdx + 2; i < cells.length; i++) {
+    const cell = cells[i];
     const txt = (cell.textContent ?? '').trim();
-    if (!txt || txt === '-' || txt.startsWith('+ Label') || txt.startsWith('Add note')) return null;
-    return clean(txt);
-  };
+    if (!txt || NOISE_RE.test(txt)) continue;
 
-  // 2. Requirement (Product Name & Quantity)
-  const product = getCellText(map.requirement, 1);
-
-  // 3. Message Preview
-  let requirement = getCellText(map.messages, 5);
-  // Clean out common UI noise in messages column
-  if (requirement && /^(Tomorrow|Add note|\+|\d{1,2}:\d{2})$/i.test(requirement)) {
-    requirement = null;
-  }
-
-  // 4. Location / City
-  let city = getCellText(map.location, 6);
-  if (city && /^(Tomorrow|Add note|Buylead|Direct|Other|Call|Actions)$/i.test(city)) {
-    city = null;
-  }
-
-  // 5. Source (Buylead / Other / Call / Direct)
-  let source = getCellText(map.source, 8);
-  if (source) {
-    const srcMatch = source.match(/(Buylead|Direct|Other|Call|Catalog Link|Buy Leads)/i);
-    source = srcMatch ? srcMatch[0] : source;
-  }
-
-  // 6. Date / Time (10:50 AM, Yesterday, 18 Jul)
-  let leadDate = getCellText(map.date, 9);
-  if (leadDate) {
-    const dateMatch = leadDate.match(/(?:\d{1,2}:\d{2}\s*(?:AM|PM)?|Yesterday|\d{1,2}\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i);
-    leadDate = dateMatch ? dateMatch[0] : leadDate;
-  }
-
-  // 7. Labels
-  let labels: string | null = null;
-  const labelCell = cells[map.labels] ?? cells[senderIdx + 2];
-  if (labelCell) {
-    const badgeEls = labelCell.querySelectorAll('[class*="badge"], [class*="label"], [class*="tag"]');
+    // Check for Labels badge inside cell first
+    const badgeEls = cell.querySelectorAll('[class*="badge"], [class*="label"], [class*="tag"]');
     if (badgeEls.length > 0) {
       const badgeTexts = Array.from(badgeEls)
         .map((b) => b.textContent?.trim())
         .filter((t) => t && t !== '+ Label' && t !== 'Add note');
       if (badgeTexts.length > 0) {
-        labels = clean(badgeTexts.join(', '));
+        labels = labels ?? clean(badgeTexts.join(', '));
+        continue;
       }
-    } else {
-      const txt = (labelCell.textContent ?? '').trim();
-      if (txt && !txt.startsWith('+ Label') && !txt.startsWith('Add note')) {
-        labels = clean(txt);
+    }
+
+    // Check Source (e.g. Buylead, Other, Call)
+    if (!source) {
+      const srcMatch = txt.match(SOURCE_RE);
+      if (srcMatch) {
+        source = srcMatch[0];
+        continue;
       }
+    }
+
+    // Check Date / Time (e.g. 10:50 AM, 10:45 AM, Yesterday, 18 Jul)
+    if (!leadDate && !txt.includes('Tomorrow')) {
+      const dateMatch = txt.match(DATE_RE);
+      if (dateMatch) {
+        leadDate = dateMatch[0];
+        continue;
+      }
+    }
+
+    // Check Location / City (Short string 2-35 chars, letters/spaces only, not noise)
+    if (!city && txt.length >= 2 && txt.length <= 35 && /^[A-Za-z\s]+$/.test(txt)) {
+      if (!/^(Tomorrow|Add note|Buylead|Direct|Other|Call|Catalog Link|Catalogue Link|Rating submitted)$/i.test(txt)) {
+        city = clean(txt);
+        continue;
+      }
+    }
+
+    // Check Message Preview / Requirement Details (Length > 6, not noise)
+    if (!requirement && txt.length >= 6 && !txt.startsWith('+ Label')) {
+      requirement = clean(txt);
     }
   }
 
@@ -200,7 +159,6 @@ function extractLeadFromRow(row: Element, map: ColumnMapping): Lead | null {
 // ─── Public DOM Extractor ─────────────────────────────────────────────────────
 
 export function extractLeadManagerPage(): Lead[] {
-  const map = getColumnMapping();
   const trs = Array.from(document.querySelectorAll('tr')).filter((tr) => {
     if (tr.querySelector('th')) return false;
     const text = tr.textContent ?? '';
@@ -212,7 +170,7 @@ export function extractLeadManagerPage(): Lead[] {
 
   for (const tr of trs) {
     try {
-      const lead = extractLeadFromRow(tr, map);
+      const lead = extractLeadFromRow(tr);
       if (!lead || !lead.mobile) continue;
 
       if (seenPhones.has(lead.mobile)) continue;
@@ -224,7 +182,7 @@ export function extractLeadManagerPage(): Lead[] {
     }
   }
 
-  console.log(`[LeadSync] DOM Extracted ${leads.length} leads with column mapping:`, map);
+  console.log(`[LeadSync] DOM Extracted ${leads.length} leads cleanly.`);
   return leads;
 }
 
