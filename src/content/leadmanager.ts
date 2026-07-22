@@ -37,7 +37,7 @@ function extractLeadFromRow(row: Element, mobile: string): Lead | null {
   let node;
   const texts: string[] = [];
   while ((node = walker.nextNode())) {
-    const t = (node.nodeValue || '').trim();
+    const t = (node.nodeValue || '').replace(/\s+/g, ' ').trim();
     if (t) texts.push(t);
   }
 
@@ -66,16 +66,14 @@ function extractLeadFromRow(row: Element, mobile: string): Lead | null {
      }
   }
 
-  let requirement: string | null = null;
-  let city: string | null = null;
   let source: string | null = null;
   let leadDate: string | null = null;
   let labels: string | null = null;
-  let product: string | null = null;
+  const unclassified: string[] = [];
 
   for (let i = senderIdx + 1; i < texts.length; i++) {
      const txt = texts[i];
-     if (NOISE_RE.test(txt)) continue;
+     if (/^(Add note|\+.*|Labels?|Actions|Manage|Folders|Reply|Send|Ignore|Delete|View|Verified|GST|Premium|Next|Previous|Page \d+)$/i.test(txt)) continue;
 
      if (!source && SOURCE_RE.test(txt)) {
        source = txt.match(SOURCE_RE)![0];
@@ -85,21 +83,24 @@ function extractLeadFromRow(row: Element, mobile: string): Lead | null {
        leadDate = txt.match(DATE_RE)![0];
        continue;
      }
-     if (!city && txt.length >= 3 && txt.length <= 35 && /^[A-Za-z\s,]+$/.test(txt)) {
-       if (!/^(Tomorrow|Add note|Buylead|Direct|Other|Call|Catalog Link|Catalogue Link|Rating submitted)$/i.test(txt)) {
-         city = clean(txt);
-         continue;
-       }
-     }
-     if (!product && txt.length > 4 && !txt.startsWith('+') && !txt.includes('Label')) {
-        product = clean(txt);
-        continue;
-     }
-     if (product && !requirement && txt.length > 5) {
-        requirement = clean(txt);
-        continue;
-     }
+     unclassified.push(txt);
   }
+
+  let city: string | null = null;
+  if (unclassified.length > 0 && unclassified[0].length < 40 && !/^(hi|hello|dear|greetings)\b/i.test(unclassified[0])) {
+      city = clean(unclassified.shift()!);
+  }
+
+  const productTexts: string[] = [];
+  for (const u of unclassified) {
+     if (/^(hi\b|hello\b|dear\b|greetings\b|i am interested|please send|quote|require)/i.test(u)) {
+        // Skip messages
+        continue;
+     }
+     if (u.length > 3) productTexts.push(u);
+  }
+
+  let product = productTexts.length > 0 ? clean(productTexts.join(' | ')) : null;
 
   const anchor = row.querySelector<HTMLAnchorElement>('a[href*="messagecentre"], a[href*="lead"], a[href*="contact"]');
 
@@ -110,13 +111,13 @@ function extractLeadFromRow(row: Element, mobile: string): Lead | null {
     email: null,
     product,
     quantity: null,
-    requirement,
+    requirement: null, // Skipped message
     city,
     state: null,
     budget: null,
     source,
     leadDate,
-    labels: labels || null,
+    labels,
     sourceUrl: anchor?.href ?? window.location.href,
   };
 }
@@ -138,25 +139,25 @@ export function extractLeadManagerPage(): Lead[] {
 
   for (const pNode of phoneNodes) {
     let el = pNode.parentElement;
-    let rowEl: HTMLElement | null = null;
-    let fallbackEl: HTMLElement | null = null;
+    let targetRow: HTMLElement | null = null;
 
+    // Traverse up to find the largest container that ONLY has this lead's phone number
     while (el && el !== document.body) {
-      const tag = el.tagName.toUpperCase();
-      const cls = typeof el.className === 'string' ? el.className.toLowerCase() : '';
-      if (tag === 'TR' || 
-          (tag === 'DIV' && /row|list-item|list_item|msg-item|lead-item/.test(cls)) ||
-          (tag === 'LI')) {
-        rowEl = el;
-        break;
+      const text = el.textContent || '';
+      const phones = [...text.matchAll(/(?:0|\+91|91)?([6-9]\d{9}|\d{10})/g)]
+        .map(m => m[1])
+        .filter(Boolean);
+      
+      const uniquePhones = new Set(phones);
+      
+      if (uniquePhones.size > 2) {
+        break; // Hit the list container holding multiple leads
       }
-      if (!fallbackEl && (el.textContent || '').length > 50 && (el.textContent || '').length < 1000) {
-        fallbackEl = el;
-      }
+      
+      targetRow = el;
       el = el.parentElement;
     }
 
-    const targetRow = rowEl || fallbackEl;
     if (!targetRow) continue;
 
     const phoneStr = extractPhone(pNode.nodeValue || '');

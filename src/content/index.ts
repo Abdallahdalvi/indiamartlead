@@ -62,6 +62,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (!nextBtn) {
       sendResponse({ success: true, data: { hasNext: false } });
     } else {
+      // Dispatch full mouse sequence to ensure SPA frameworks pick it up
+      nextBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+      nextBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
       nextBtn.click();
       sendResponse({ success: true, data: { hasNext: true } });
     }
